@@ -1,0 +1,73 @@
+name: Morning Briefing
+
+# Runs at 6:45 AM across all timezones Gus is likely to be in.
+# The Python script deduplicates — only one briefing fires per day
+# (whichever cron trigger lands within the 6:45 AM local window).
+#
+# Covered UTC offsets and their 6:45 AM local → UTC equivalent:
+#   PDT  (UTC-7)  → 13:45 UTC
+#   CDT  (UTC-6)  → 12:45 UTC   ← Mexico City
+#   EDT  (UTC-5)  → 11:45 UTC   ← Princeton / New York
+#   BST  (UTC+1)  → 05:45 UTC   ← London (summer)
+#   CEST (UTC+2)  → 04:45 UTC   ← Central Europe (summer)
+#   EEST (UTC+3)  → 03:45 UTC   ← Eastern Europe / Istanbul
+#   GST  (UTC+4)  → 02:45 UTC   ← Dubai
+#   SGT  (UTC+8)  → 22:45 UTC   (previous day — runs correctly)
+#   JST  (UTC+9)  → 21:45 UTC   (previous day)
+#
+# Each hour also fires a :15 backup run so a delayed GitHub schedule
+# still lands inside the morning send window. The script's dedup
+# guarantees only one email per day regardless of how many fire.
+#
+# To add a new timezone: compute UTC = 06:45 - offset, add a cron entry.
+
+on:
+  schedule:
+    - cron: '45 2  * * *'   # GST UTC+4 (Dubai)
+    - cron: '15 3  * * *'
+    - cron: '45 3  * * *'   # EEST UTC+3 (Eastern Europe)
+    - cron: '15 4  * * *'
+    - cron: '45 4  * * *'   # CEST UTC+2 (Central Europe)
+    - cron: '15 5  * * *'
+    - cron: '45 5  * * *'   # BST UTC+1 (London summer)
+    - cron: '15 6  * * *'
+    - cron: '45 6  * * *'   # UTC+0 (London winter / GMT)
+    - cron: '45 11 * * *'   # EDT UTC-5 (Princeton/NY)
+    - cron: '15 12 * * *'
+    - cron: '45 12 * * *'   # CDT UTC-6 (Mexico City, Chicago)
+    - cron: '15 13 * * *'
+    - cron: '45 13 * * *'   # PDT UTC-7 (Bay Area summer)
+    - cron: '15 14 * * *'
+    - cron: '45 14 * * *'   # PST UTC-8 (Bay Area winter)
+    - cron: '45 21 * * *'   # JST UTC+9 (Japan)
+    - cron: '45 22 * * *'   # SGT UTC+8 (Singapore / Hong Kong)
+  workflow_dispatch:         # Manual trigger for testing
+
+jobs:
+  briefing:
+    name: Generate and deliver morning briefing
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: briefing/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r briefing/requirements.txt
+
+      - name: Run briefing generator
+        env:
+          ANTHROPIC_API_KEY:      ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_CLIENT_ID:       ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET:   ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN:   ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          BRAVE_SEARCH_API_KEY:   ${{ secrets.BRAVE_SEARCH_API_KEY }}
+        run: python briefing/generate_briefing.py
