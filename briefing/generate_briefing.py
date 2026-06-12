@@ -440,16 +440,24 @@ def main():
     calendar_svc = build("calendar", "v3", credentials=creds)
     gmail_svc    = build("gmail",    "v1", credentials=creds)
 
+    # FORCE_SEND=true (set only by a manual run with the force_send box checked)
+    # bypasses the morning window and the once-per-day guard so you can test
+    # any time. Scheduled runs never set it, so normal timing is unaffected.
+    force = os.environ.get("FORCE_SEND", "").strip().lower() == "true"
+
     tz_str = infer_timezone(calendar_svc)
     in_window, local_now = is_briefing_window(tz_str)
 
-    if not in_window:
+    if not force and not in_window:
         log.info("Outside morning send window for %s (local %s). Exiting.", tz_str, local_now.strftime("%H:%M"))
         sys.exit(0)
 
-    if already_sent_today(gmail_svc, tz_str):
+    if not force and already_sent_today(gmail_svc, tz_str):
         log.info("Already sent today. Exiting.")
         sys.exit(0)
+
+    if force:
+        log.info("FORCE_SEND enabled — bypassing window/dedup for a test run.")
 
     calendar_data = fetch_calendar_events(calendar_svc, tz_str)
 
