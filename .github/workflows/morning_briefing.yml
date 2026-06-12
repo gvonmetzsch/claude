@@ -42,6 +42,11 @@ on:
     - cron: '45 21 * * *'   # JST UTC+9 (Japan)
     - cron: '45 22 * * *'   # SGT UTC+8 (Singapore / Hong Kong)
   workflow_dispatch:         # Manual trigger for testing
+    inputs:
+      force_send:
+        description: "Send a test briefing now, ignoring the 6:45 AM window"
+        type: boolean
+        default: false
 
 jobs:
   briefing:
@@ -70,4 +75,5 @@ jobs:
           GOOGLE_CLIENT_SECRET:   ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN:   ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           BRAVE_SEARCH_API_KEY:   ${{ secrets.BRAVE_SEARCH_API_KEY }}
+          FORCE_SEND:             ${{ inputs.force_send }}
         run: python briefing/generate_briefing.py
