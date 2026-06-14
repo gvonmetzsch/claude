@@ -5,6 +5,8 @@ Runs daily via GitHub Actions, delivers to gvonmetzsch@gmail.com at 6:45 AM loca
 Timezone is inferred from the most recent flight destination in Google Calendar.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import json
@@ -33,6 +35,50 @@ TARGET_MINUTE = 45
 # Send if local time is in [6:45 AM, MORNING_CUTOFF). Tolerates GitHub schedule
 # delays and lets the first morning run win; dedup prevents repeats.
 MORNING_CUTOFF_HOUR = 11
+
+# ─── EMAIL THEME (edit me) ──────────────────────────────────────────────────
+# We ship a SOFT LIGHT palette engineered for Gmail's mobile dark-mode flip:
+# Gmail's app partially color-INVERTS emails it reads in dark mode (it ignores
+# prefers-color-scheme / color-scheme meta on mobile), so a comfortable, medium-
+# contrast light design inverts into a clean dark one — while the un-flipped
+# browser view stays easy on the eyes. Never pure #fff / #000 (those invert
+# harshly). To switch back to a native dark look later, set EMAIL_THEME = "dark".
+EMAIL_THEME = "light"
+THEMES = {
+    "light": {
+        "page_bg": "#eef0f4",   # soft light gray (never #ffffff)
+        "card_bg": "#f9fafc",   # off-white card
+        "text":    "#33384a",   # dark slate (never #000) — medium contrast
+        "muted":   "#6b7280",   # muted labels / meta
+        "accent":  "#1664c0",   # clear blue (inverts to a pleasant light blue)
+        "border":  "#dde1e8",   # hairline borders
+    },
+    "dark": {
+        "page_bg": "#0d0d16",
+        "card_bg": "#15151f",
+        "text":    "#e8e8f0",
+        "muted":   "#9aa0b8",
+        "accent":  "#00d4ff",
+        "border":  "#262636",
+    },
+}
+PALETTE = THEMES[EMAIL_THEME]
+
+# ─── GOOGLE KEEP TODOS (edit me) ────────────────────────────────────────────
+# Todos live in Google Keep (no official personal API) and are read via the
+# unofficial gkeepapi library using a master token on a SECONDARY account
+# (GOOGLE_KEEP_EMAIL / GOOGLE_KEEP_MASTER_TOKEN). Keep sharing is per-note, so
+# each note to be read must be shared into that account. Notes are plain text
+# (not checklists). The note below is the primary focus; other notes are skimmed.
+KEEP_PRIMARY_NOTE_TITLE = "Tasks"
+KEEP_SKIM_OTHER_NOTES   = True   # also lightly skim non-primary notes for todos
+KEEP_MAX_OTHER_NOTES    = 12     # cap how many other notes get skimmed
+KEEP_MAX_LINES_PER_NOTE = 40     # truncate long notes
+
+# ─── WHOOP (official OAuth2 v2 API) ─────────────────────────────────────────
+WHOOP_TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
+WHOOP_API_BASE  = "https://api.prod.whoop.com/developer/v2"
+WHOOP_LOOKBACK_DAYS = 7   # retrospective window (user is usually still asleep at send time)
 
 # IATA city codes → pytz timezone strings
 AIRPORT_TZ = {
@@ -340,6 +386,225 @@ def web_search(query: str, num: int = 5) -> list[dict]:
         return []
 
 
+# ──────────────────────────────────── WHOOP ─────────────────────────────────
+# WHOOP uses OAuth2 with ROTATING refresh tokens: every refresh returns a NEW
+# refresh token and invalidates the old one. Because the token lives in a GitHub
+# Actions secret, we must write the rotated token back (via the GitHub REST API +
+# libsodium sealed box) or the next run can't authenticate. All of this is
+# fail-soft: any WHOOP error returns None so the briefing still builds.
+
+def persist_whoop_refresh_token(new_token: str) -> None:
+    """Write the rotated WHOOP refresh token back into the WHOOP_REFRESH_TOKEN
+    GitHub Actions secret. No-op if unchanged or if no PAT is configured (so
+    local/manual runs still work — the token just won't rotate there)."""
+    current = os.environ.get("WHOOP_REFRESH_TOKEN", "")
+    if not new_token or new_token == current:
+        return
+    pat = os.environ.get("GH_SECRETS_PAT", "")
+    if not pat:
+        log.warning("WHOOP refresh token rotated but GH_SECRETS_PAT is unset — "
+                    "cannot persist; next scheduled run may fail to authenticate.")
+        return
+    try:
+        from nacl import encoding, public  # lazy import (only needed here)
+
+        repo = os.environ.get("GITHUB_REPOSITORY", "gvonmetzsch/claude")
+        api = f"https://api.github.com/repos/{repo}/actions/secrets"
+        headers = {
+            "Authorization": f"Bearer {pat}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        key_resp = requests.get(f"{api}/public-key", headers=headers, timeout=10)
+        key_resp.raise_for_status()
+        key_data = key_resp.json()
+        pk = public.PublicKey(key_data["key"].encode(), encoding.Base64Encoder())
+        sealed = public.SealedBox(pk).encrypt(new_token.encode())
+        encrypted_value = base64.b64encode(sealed).decode()
+        put_resp = requests.put(
+            f"{api}/WHOOP_REFRESH_TOKEN",
+            headers=headers,
+            json={"encrypted_value": encrypted_value, "key_id": key_data["key_id"]},
+            timeout=10,
+        )
+        put_resp.raise_for_status()
+        log.info("Persisted rotated WHOOP refresh token to GitHub secret.")
+    except Exception as exc:
+        log.warning("Failed to persist rotated WHOOP refresh token: %s — "
+                    "next scheduled run may fail to authenticate.", exc)
+
+
+def whoop_refresh_access_token() -> str:
+    """Exchange the stored refresh token for an access token. WHOOP returns a new
+    refresh token each time (with the 'offline' scope), which we persist
+    immediately so it is never lost. Returns the access token."""
+    resp = requests.post(
+        WHOOP_TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": os.environ["WHOOP_REFRESH_TOKEN"],
+            "client_id": os.environ["WHOOP_CLIENT_ID"],
+            "client_secret": os.environ["WHOOP_CLIENT_SECRET"],
+            "scope": "offline",
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    tok = resp.json()
+    new_refresh = tok.get("refresh_token")
+    if new_refresh:
+        # Persist immediately — even if the data calls below fail, the freshly
+        # issued refresh token must survive for the next run.
+        persist_whoop_refresh_token(new_refresh)
+        os.environ["WHOOP_REFRESH_TOKEN"] = new_refresh
+    return tok["access_token"]
+
+
+def _whoop_get(path: str, headers: dict, params: dict | None = None) -> dict:
+    resp = requests.get(f"{WHOOP_API_BASE}{path}", headers=headers,
+                        params=params or {}, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_whoop_data() -> dict | None:
+    """Pull a retrospective ~7-day WHOOP snapshot (recovery trend, recent sleep,
+    daily strain, notable workouts). The briefing usually fires before the user
+    has woken up, so last night's sleep may not exist yet — we pull history and
+    treat last night as 'include if present'. Fail-soft: returns None on error."""
+    if not all(os.environ.get(k) for k in
+               ("WHOOP_CLIENT_ID", "WHOOP_CLIENT_SECRET", "WHOOP_REFRESH_TOKEN")):
+        return None
+    try:
+        access = whoop_refresh_access_token()
+        headers = {"Authorization": f"Bearer {access}"}
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(days=WHOOP_LOOKBACK_DAYS)).isoformat()
+        end = now.isoformat()
+        window = {"start": start, "end": end, "limit": 25}
+
+        data: dict = {}
+
+        def safe(label, fn):
+            try:
+                return fn()
+            except Exception as exc:
+                log.warning("WHOOP %s fetch failed: %s", label, exc)
+                return None
+
+        # Recovery trend (newest first)
+        rec = safe("recovery", lambda: _whoop_get("/recovery", headers, window))
+        if rec:
+            recs = []
+            for r in rec.get("records", []):
+                s = r.get("score") or {}
+                recs.append({
+                    "date": r.get("created_at", "")[:10],
+                    "recovery_score": s.get("recovery_score"),
+                    "hrv_ms": s.get("hrv_rmssd_milli"),
+                    "resting_hr": s.get("resting_heart_rate"),
+                })
+            data["recovery_week"] = recs
+            data["latest_recovery"] = recs[0] if recs else None
+
+        # Recent sleep (last few nights; last night only if recorded)
+        slp = safe("sleep", lambda: _whoop_get("/activity/sleep", headers, window))
+        if slp:
+            sleeps = []
+            for r in slp.get("records", [])[:5]:
+                s = r.get("score") or {}
+                stage = s.get("stage_summary") or {}
+                in_bed_ms = (stage.get("total_in_bed_time_milli") or 0)
+                awake_ms = (stage.get("total_awake_time_milli") or 0)
+                hours = round(max(in_bed_ms - awake_ms, 0) / 3_600_000, 1) or None
+                sleeps.append({
+                    "date": r.get("end", "")[:10],
+                    "performance_pct": s.get("sleep_performance_percentage"),
+                    "efficiency_pct": s.get("sleep_efficiency_percentage"),
+                    "hours": hours,
+                })
+            data["sleep_recent"] = sleeps
+
+        # Daily strain trend
+        cyc = safe("cycle", lambda: _whoop_get("/cycle", headers, window))
+        if cyc:
+            strains = []
+            for r in cyc.get("records", []):
+                s = r.get("score") or {}
+                strains.append({"date": r.get("start", "")[:10],
+                                "strain": s.get("strain")})
+            data["strain_week"] = strains
+
+        # Notable workouts in the window (so "major things you've done" can surface)
+        wko = safe("workout", lambda: _whoop_get("/activity/workout", headers, window))
+        if wko:
+            workouts = []
+            for r in wko.get("records", []):
+                s = r.get("score") or {}
+                workouts.append({
+                    "date": r.get("start", "")[:10],
+                    "sport": r.get("sport_name") or r.get("sport_id"),
+                    "strain": s.get("strain"),
+                    "kilojoule": s.get("kilojoule"),
+                })
+            data["workouts_week"] = workouts
+
+        return data or None
+    except Exception as exc:
+        log.warning("WHOOP fetch failed: %s", exc)
+        return None
+
+
+# ──────────────────────────────── Google Keep ───────────────────────────────
+# Todos live in Google Keep, which has no official personal API. We read them via
+# the unofficial gkeepapi library (master-token auth) on a SECONDARY account.
+# This is against Google's ToS and can break on Google-side changes, so it's kept
+# fully fail-soft and runs last. Each note must be shared into the secondary
+# account (Keep sharing is per-note). Notes are plain text, not checklists.
+
+def fetch_keep_todos() -> dict | None:
+    """Return the primary 'Tasks' note plus a light skim of other notes, as plain
+    text lines. Fail-soft: returns None if secrets are missing or anything errors."""
+    email = os.environ.get("GOOGLE_KEEP_EMAIL", "")
+    master_token = os.environ.get("GOOGLE_KEEP_MASTER_TOKEN", "")
+    if not email or not master_token:
+        return None
+    try:
+        import gkeepapi  # lazy import so a missing/broken lib can't crash module load
+
+        keep = gkeepapi.Keep()
+        keep.authenticate(email, master_token)
+        keep.sync()
+
+        def note_lines(note):
+            text = getattr(note, "text", "") or ""
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            return lines[:KEEP_MAX_LINES_PER_NOTE]
+
+        primary = None
+        others = []
+        for note in keep.all():
+            if getattr(note, "trashed", False) or getattr(note, "archived", False):
+                continue
+            title = (getattr(note, "title", "") or "").strip()
+            lines = note_lines(note)
+            if not title and not lines:
+                continue
+            if title.lower() == KEEP_PRIMARY_NOTE_TITLE.lower():
+                primary = {"title": title or KEEP_PRIMARY_NOTE_TITLE, "lines": lines}
+            elif KEEP_SKIM_OTHER_NOTES and lines:
+                others.append({"title": title, "lines": lines})
+
+        others = others[:KEEP_MAX_OTHER_NOTES]
+        if not primary and not others:
+            return None
+        return {"primary": primary, "other": others}
+    except Exception as exc:
+        log.warning("Google Keep fetch failed: %s", exc)
+        return None
+
+
 # ────────────────────────────── Main generation ────────────────────────────
 
 SYSTEM_PROMPT = """You are a sharp, concise AI assistant generating a personalized morning briefing email for August (Gus) von Metzsch.
@@ -351,16 +616,24 @@ About Gus:
 - Bay Area native, also follows Boston teams and Princeton athletics
 
 Briefing rules:
-1. CALENDAR: Bullet points with brief prose within each. Include events with times, tasks with due dates. If the calendar is empty today, say so in ONE line. After today, add a very brief prose overview of the day, next week, and next month (1-2 sentences each, weighted by how much is happening).
+1. OPENING (lead the email with this, in order):
+   a) A brief PROSE PARAGRAPH (a few sentences, warm personal-assistant tone) that weaves together: a SHORT retrospective WHOOP read (how recovery/strain have trended over yesterday and the past week, plus any notable workouts — keep it brief, and only mention last night's sleep if sleep data for last night is actually present), the day's todos at a high level (heavily weight the note titled "Tasks"; lightly fold in anything clearly todo-like skimmed from the other notes), and what today's calendar holds. If something from the rest of the briefing body is genuinely MAJOR, it may earn one sentence here too. Omit WHOOP or todos silently if their data is absent — never mention missing data.
+   b) QUICK KEY TASKS: a tight bulleted list of the few most important/actionable todos (drawn mainly from "Tasks"). Skip if there are none.
+   c) CALENDAR: bullet points with brief prose within each — today's events with times, tasks with due dates. If the calendar is empty today, say so in ONE line. After today, add a very brief prose overview of the day, next week, and next month (1-2 sentences each, weighted by how much is happening).
 2. INBOX: Lead with time-sensitive items (deadlines, things awaiting a reply). One line per item with sender. SKIP newsletters here. Skip promotional/automated noise unless it has a clear action item (package/flight status, etc.). Sort by priority/action type, with a short 'potentially relevant' group at the end. No commentary on who emails are addressed to. If nothing substantial, say nothing about there being nothing.
 3. NEWS: Start from newsletter content, fill gaps with search results, preferring newsletter content. Priority order: world headlines (major items + maybe 1 niche cool one) -> 3 WSJ links (one macro, one company/industry, one op-ed; FT/Economist/NYT acceptable fallback) -> markets & macro -> M&A/PE/dealflow -> tech/AI -> athletics (lacrosse NCAA D1 + pro, football, golf, snow sports, hockey, basketball, baseball; bias Princeton, Bay Area, Boston) -> 3 unique niche cool things -> 3 learning points (>=1 on actionable tech/AI skill or workflow). Skip empty categories rather than padding. Tight, mostly bullets. Only include links you are confident are live.
 4. If any section/subsection is empty, skip it entirely with no mention (Calendar's 'empty today' one-liner is the only exception).
-5. Output ONLY the HTML email body. Table-based layout, all inline CSS, no JS, no external fonts, web-safe fonts only. Sleek futuristic/tech but minimal aesthetic. MUST be clearly readable on Gmail mobile and web in BOTH light and dark mode. Dark card on near-black background, cyan accent.
+5. FORMATTING — output ONLY the HTML email body (no DOCTYPE/html/head; just the visible content starting with a wrapper table). Hard requirements:
+   - Table-based layout only (nested <table>; no <div> for structure). ALL CSS inline. No <style> block, no JS, no external resources, no web fonts. Web-safe fonts only: Arial/Helvetica for everything, Courier New ONLY for small uppercase section labels.
+   - CRITICAL for Gmail mobile dark mode (which partially color-INVERTS the email): put an explicit bgcolor="..." attribute AND an inline background-color on EVERY <table>, <tr>, and <td> — including spacer/padding cells and the outer wrapper. No cell may be left without a background. NEVER use pure #000000 or #ffffff for any background or text. Use ONLY the exact palette hex values given in the user message. This is what makes the inversion render cleanly.
+   - Set explicit inline font-size (in px), font-weight, line-height (in px), and color on EVERY text element; put margin:0 on any heading tags. Never rely on a tag's default sizing (Gmail mobile re-scales it). Use the exact type scale given in the user message.
+   - Aesthetic: clean, minimal, modern. Must read well on Gmail mobile (in dark mode, post-inversion), Gmail web (light), and Apple Mail — comfortable medium contrast, not harsh.
 6. Target 1000-2500 words of visible text.
 """
 
 
-def build_user_prompt(calendar_data, inbox_items, newsletters, news_results, tz_str, local_now):
+def build_user_prompt(calendar_data, inbox_items, newsletters, news_results, tz_str,
+                      local_now, whoop_data=None, keep_todos=None):
     day = local_now.day
     suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
     date_str = local_now.strftime(f"%B %-d{suffix}, %Y")
@@ -369,6 +642,23 @@ def build_user_prompt(calendar_data, inbox_items, newsletters, news_results, tz_
     parts = [
         f"# SUBJECT LINE\n{subject}\n",
         f"# CURRENT TIMEZONE\n{tz_str} (it is {local_now.strftime('%I:%M %p %Z')} locally)\n",
+    ]
+
+    # OPENING INPUTS — feed WHOOP + todos so the email can lead with them.
+    if whoop_data or keep_todos:
+        parts.append("\n# OPENING INPUTS (for the opening paragraph + key tasks)\n")
+        if whoop_data:
+            parts.append(
+                "\n## WHOOP (retrospective ~7 days; usually no last-night sleep yet — "
+                "summarize trends, mention last night only if present)\n"
+                f"{json.dumps(whoop_data, indent=2, default=str)}\n")
+        if keep_todos:
+            parts.append(
+                '\n## TODOS (from Google Keep; the "Tasks" note under "primary" is the '
+                'main focus, "other" notes are for a light skim)\n'
+                f"{json.dumps(keep_todos, indent=2, default=str)}\n")
+
+    parts += [
         f"\n# CALENDAR DATA\n{json.dumps(calendar_data, indent=2, default=str)}\n",
         f"\n# INBOX ITEMS (since last briefing)\n{json.dumps(inbox_items, indent=2)}\n",
         "\n# NEWSLETTER CONTENT (plain text, already stripped)\n",
@@ -378,12 +668,32 @@ def build_user_prompt(calendar_data, inbox_items, newsletters, news_results, tz_
     parts.append("\n# WEB SEARCH NEWS RESULTS (use to fill gaps only)\n")
     for topic, results in news_results.items():
         parts.append(f"\n## {topic}\n{json.dumps(results, indent=2)}\n")
-    parts.append("""
+
+    p = PALETTE
+    parts.append(f"""
 # OUTPUT INSTRUCTIONS
-Generate the complete HTML email body (no DOCTYPE/html/head — just the visible content in a wrapper table).
+Generate the complete HTML email body (no DOCTYPE/html/head — just the visible content, starting with a wrapper table).
 First line must be a comment: <!-- SUBJECT: the subject line here -->
-Sleek futuristic minimal aesthetic: near-black background (#08080f), dark card (#0f0f1c), cyan accent (#00d4ff), light text (#c8c8e0), muted labels (#4a5070). Use monospace (Courier New) only for small section labels; Arial/Helvetica for body.
-Table-based layout. All CSS inline. No external resources, no web fonts, no JS. Must read well on Gmail mobile + web, light + dark mode.
+
+PALETTE — use ONLY these hex values (never pure #000000 or #ffffff anywhere):
+  page background: {p['page_bg']}
+  card background: {p['card_bg']}
+  body text:       {p['text']}
+  muted/meta:      {p['muted']}
+  accent:          {p['accent']}
+  hairline border: {p['border']}
+
+LAYOUT: a single outer 100%-width wrapper <table> with bgcolor="{p['page_bg']}", containing a centered max-width 600px content <table> with bgcolor="{p['card_bg']}". Put an explicit bgcolor AND inline background-color on EVERY table/tr/td (including spacer/padding cells) — this is required so Gmail mobile dark mode inverts the email cleanly.
+
+TYPE SCALE (inline font-size in px, explicit line-height in px, margin:0 on headings; Arial/Helvetica, Courier New only for the small mono labels):
+  Email title (H1):    26px / weight 700 / line-height 32px
+  Section header (H2): 18px / weight 700 / line-height 24px / color {p['accent']}
+  Mono section label:  11px / weight 700 / line-height 16px / letter-spacing 1.5px / uppercase / Courier New / color {p['muted']}
+  Sub-header (H3):     15px / weight 700 / line-height 20px
+  Body:                15px / weight 400 / line-height 22px (never below 14px)
+  Small / meta:        12px / weight 400 / line-height 17px / color {p['muted']}
+
+All CSS inline. No <style> block, no external resources, no web fonts, no JS. Comfortable medium contrast — must read well on Gmail mobile (dark mode, after inversion), Gmail web (light), and Apple Mail.
 """)
     return "".join(parts)
 
@@ -405,16 +715,23 @@ def generate_html_briefing(user_prompt: str) -> tuple[str, str]:
 # ─────────────────────────────── Gmail sending ─────────────────────────────
 
 def send_email(gmail_service, subject: str, html_body: str):
+    page_bg = PALETTE["page_bg"]
+    # No color-scheme meta: we do NOT want Gmail to negotiate a scheme (it ignores
+    # it on mobile anyway). Instead we wrap the body in a real full-bleed background
+    # table, since Gmail strips <body> styling and renders into its own div.
     full_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<meta name="color-scheme" content="light dark">
 <title>{subject}</title>
 </head>
-<body style="margin:0;padding:0;background-color:#08080f;" bgcolor="#08080f">
+<body style="margin:0;padding:0;background-color:{page_bg};" bgcolor="{page_bg}">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="{page_bg}" style="background-color:{page_bg};">
+<tr bgcolor="{page_bg}"><td bgcolor="{page_bg}" style="background-color:{page_bg};">
 {html_body}
+</td></tr>
+</table>
 </body>
 </html>"""
     msg = MIMEMultipart("alternative")
@@ -482,7 +799,15 @@ def main():
     }
     news_results = {topic: web_search(q) for topic, q in news_queries.items()}
 
-    user_prompt   = build_user_prompt(calendar_data, inbox_items, newsletters, news_results, tz_str, local_now)
+    # Opening-section data (both fail-soft → None on any error). WHOOP refreshes a
+    # rotating token, so it runs here — past the window/dedup guards — i.e. only on
+    # send-eligible runs, ~once/day. Keep is last (slow full sync, most fragile).
+    whoop_data = fetch_whoop_data()
+    keep_todos = fetch_keep_todos()
+
+    user_prompt   = build_user_prompt(calendar_data, inbox_items, newsletters,
+                                      news_results, tz_str, local_now,
+                                      whoop_data=whoop_data, keep_todos=keep_todos)
     subject, html = generate_html_briefing(user_prompt)
     send_email(gmail_svc, subject, html)
     log.info("Done.")
