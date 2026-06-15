@@ -625,7 +625,7 @@ Briefing rules:
    b) QUICK KEY TASKS: a tight bulleted list of the few most important/actionable todos (drawn mainly from "Tasks"). Skip if there are none.
    c) CALENDAR: bullet points with brief prose within each — today's events with times, tasks with due dates. If the calendar is empty today, say so in ONE line. After today, add a very brief prose overview of the day, next week, and next month (1-2 sentences each, weighted by how much is happening).
 2. INBOX: Lead with time-sensitive items (deadlines, things awaiting a reply). One line per item with sender. SKIP newsletters here. Skip promotional/automated noise unless it has a clear action item (package/flight status, etc.). Sort by priority/action type, with a short 'potentially relevant' group at the end. No commentary on who emails are addressed to. If nothing substantial, say nothing about there being nothing.
-3. NEWS: Start from newsletter content, fill gaps with search results, preferring newsletter content. Priority order: world headlines (major items + maybe 1 niche cool one) -> 3 WSJ links (one macro, one company/industry, one op-ed; FT/Economist/NYT acceptable fallback) -> markets & macro -> M&A/PE/dealflow -> tech/AI -> athletics (lacrosse NCAA D1 + pro, football, golf, snow sports, hockey, basketball, baseball; bias Princeton, Bay Area, Boston): keep the brief prose coverage of notable storylines/news, THEN add a concise scoreboard after it — one tight line per game as "matchup/event — result" (e.g. "Princeton MLAX vs Yale — W 12-10", "Celtics @ Knicks — L 104-110"), results-only -> 3 unique niche cool things -> 3 learning points (>=1 on actionable tech/AI skill or workflow). Skip empty categories rather than padding. Tight, mostly bullets. Only include links you are confident are live.
+3. NEWS: Start from newsletter content, fill gaps with search results, preferring newsletter content. Priority order: world headlines (major items + maybe 1 niche cool one) -> 3 WSJ links (one macro, one company/industry, one op-ed; FT/Economist/NYT acceptable fallback) -> markets & macro -> M&A/PE/dealflow -> tech/AI -> athletics (lacrosse NCAA D1 + pro, football, golf, snow sports, hockey, basketball, baseball; bias Princeton, Bay Area, Boston): keep the brief prose coverage of notable storylines/news, THEN a real SCOREBOARD grouped BY SPORT. Under each sport (e.g. NHL, NBA, MLB, Lacrosse, Golf, Soccer), a tight text list of games with the ACTUAL final score — "matchup — final score" (e.g. "Oilers vs Panthers (Stanley Cup Final G5) — EDM 3-1", "Red Sox @ Yankees — BOS 6-3", "Giants @ Dodgers — LAD 4-2"). Lead each sport with Gus's teams (Princeton; Bay Area: Warriors/Giants/49ers/Sharks/A's; Boston: Celtics/Bruins/Red Sox), then include other notable/marquee results — finals & championship games (e.g. the Stanley Cup Final, NBA Finals), big upsets, and tournament leaders/standings. ALWAYS give the real score or standing; NEVER vague summaries like "Germany dominant" or "close game". Include more results rather than fewer, but only ones you're confident are real and current -> 3 unique niche cool things -> 3 learning points (>=1 on actionable tech/AI skill or workflow). Skip empty categories rather than padding. Tight, mostly bullets. Only include links you are confident are live.
 4. If any section/subsection is empty, skip it entirely with no mention (Calendar's 'empty today' one-liner is the only exception).
 5. FORMATTING — output ONLY the HTML email body (no DOCTYPE/html/head; just the visible content starting with a wrapper table). Hard requirements:
    - Table-based layout only (nested <table>; no <div> for structure). ALL CSS inline. No <style> block, no JS, no external resources, no web fonts. Web-safe fonts only: Arial/Helvetica for everything, Courier New ONLY for small uppercase section labels.
@@ -816,9 +816,16 @@ def main():
         "Markets & macro": "stock market inflation interest rates today",
         "M&A PE":          "M&A private equity deals fundraising",
         "Tech AI":         "AI OpenAI Anthropic technology news today",
-        "Lacrosse":        "NCAA lacrosse PLL Premier Lacrosse League",
-        "NBA":             "NBA Finals results",
-        "World Cup":       "FIFA World Cup results scores",
+        # Athletics — pull ACTUAL scores/results across sports (Gus's teams + marquee).
+        "Lacrosse":        "lacrosse PLL Premier Lacrosse League NCAA score result",
+        "NBA Finals":      "NBA Finals score result last night",
+        "NHL Stanley Cup": "NHL Stanley Cup Final score result last night",
+        "MLB":             "MLB scores last night Red Sox Giants Athletics",
+        "Golf":            "PGA Tour US Open golf leaderboard results today",
+        "Soccer/WC":       "FIFA World Cup 2026 results scores yesterday",
+        "Princeton":       "Princeton Tigers athletics score result",
+        "Boston teams":    "Celtics Bruins Red Sox score last night",
+        "Bay Area teams":  "Warriors Giants 49ers Sharks Athletics score last night",
     }
     news_results = {topic: web_search(q) for topic, q in news_queries.items()}
 
