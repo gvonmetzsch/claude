@@ -50,7 +50,9 @@ THEMES = {
         "card_bg": "#f9fafc",   # off-white card
         "text":    "#33384a",   # dark slate (never #000) — medium contrast
         "muted":   "#6b7280",   # muted labels / meta
-        "accent":  "#1664c0",   # clear blue (inverts to a pleasant light blue)
+        "accent":  "#1664c0",   # primary accent — clear blue
+        "accent2": "#0e8aa8",   # secondary accent — teal/cyan, for small pops
+        "chip_bg": "#e6eef9",   # tinted background for chips/eyebrows/bars
         "border":  "#dde1e8",   # hairline borders
     },
     "dark": {
@@ -59,6 +61,8 @@ THEMES = {
         "text":    "#e8e8f0",
         "muted":   "#9aa0b8",
         "accent":  "#00d4ff",
+        "accent2": "#a78bfa",
+        "chip_bg": "#1d2233",
         "border":  "#262636",
     },
 }
@@ -676,22 +680,33 @@ Generate the complete HTML email body (no DOCTYPE/html/head — just the visible
 First line must be a comment: <!-- SUBJECT: the subject line here -->
 
 PALETTE — use ONLY these hex values (never pure #000000 or #ffffff anywhere):
-  page background: {p['page_bg']}
-  card background: {p['card_bg']}
-  body text:       {p['text']}
-  muted/meta:      {p['muted']}
-  accent:          {p['accent']}
-  hairline border: {p['border']}
+  page background:   {p['page_bg']}
+  card background:   {p['card_bg']}
+  body text:         {p['text']}
+  muted/meta:        {p['muted']}
+  accent (primary):  {p['accent']}
+  accent2 (pops):    {p['accent2']}
+  chip/tint bg:      {p['chip_bg']}
+  hairline border:   {p['border']}
 
 LAYOUT: a single outer 100%-width wrapper <table> with bgcolor="{p['page_bg']}", containing a centered max-width 600px content <table> with bgcolor="{p['card_bg']}". Put an explicit bgcolor AND inline background-color on EVERY table/tr/td (including spacer/padding cells) — this is required so Gmail mobile dark mode inverts the email cleanly.
 
-TYPE SCALE (inline font-size in px, explicit line-height in px, margin:0 on headings; Arial/Helvetica, Courier New only for the small mono labels):
-  Email title (H1):    26px / weight 700 / line-height 32px
-  Section header (H2): 18px / weight 700 / line-height 24px / color {p['accent']}
-  Mono section label:  11px / weight 700 / line-height 16px / letter-spacing 1.5px / uppercase / Courier New / color {p['muted']}
-  Sub-header (H3):     15px / weight 700 / line-height 20px
-  Body:                15px / weight 400 / line-height 22px (never below 14px)
-  Small / meta:        12px / weight 400 / line-height 17px / color {p['muted']}
+TYPE SCALE (inline font-size in px, explicit line-height in px, margin:0 on headings; Arial/Helvetica for ALL headings and body; Courier New ONLY for the tiny eyebrow label):
+  Email title (H1):     28px / weight 800 / line-height 34px / color {p['text']}
+  Section header (H2):  21px / weight 800 / line-height 27px / color {p['accent']}
+  Subsection (H3):      17px / weight 700 / line-height 23px / color {p['text']}  (e.g. "TECH & AI", "MARKETS" — must be clearly readable and stand out, NOT muted, NOT Courier New, NOT tiny)
+  Tiny eyebrow label:   11px / weight 700 / line-height 15px / letter-spacing 2px / uppercase / Courier New / color {p['accent2']}  (optional accent kicker ABOVE a section — never use this size for an actual heading)
+  Body:                 15px / weight 400 / line-height 22px / color {p['text']}  (never below 14px)
+  Small / meta:         12px / weight 400 / line-height 17px / color {p['muted']}
+
+VISUAL POP — make it feel sleek and modern with small, tasteful accent touches (use sparingly so it stays clean and readable in both light and inverted-dark):
+  - Give each H2 section header a short accent bar to its left: a small cell or left-border (3-4px) in {p['accent']} or {p['accent2']}.
+  - Optionally place a tiny uppercase eyebrow label (the Courier style above, in {p['accent2']}) above major sections.
+  - Use {p['accent']} for links and {p['accent2']} sparingly for secondary highlights (a key metric, a bullet marker, a divider).
+  - Bullet markers can be a small colored "▸" or "•" in {p['accent']} instead of default list dots.
+  - Separate major sections with a thin 1px divider in {p['border']}.
+  - For a small standout stat or tag (e.g. a WHOOP recovery %), use a chip: padding ~2-6px, background {p['chip_bg']}, text in {p['accent']} (or {p['text']}), bold.
+  - Keep it minimal — a few accents per section, not everywhere. Text must stay high-contrast and easy to read.
 
 All CSS inline. No <style> block, no external resources, no web fonts, no JS. Comfortable medium contrast — must read well on Gmail mobile (dark mode, after inversion), Gmail web (light), and Apple Mail.
 """)
@@ -700,12 +715,19 @@ All CSS inline. No <style> block, no external resources, no web fonts, no JS. Co
 
 def generate_html_briefing(user_prompt: str) -> tuple[str, str]:
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    message = client.messages.create(
+    # Stream a large max_tokens: the inline-CSS table HTML is token-heavy, so an
+    # 8K cap truncated the email mid-tag. claude-opus-4-8 allows up to 128K output
+    # but the SDK requires streaming above ~16K (non-streaming would hit the
+    # ~10-min HTTP timeout). 32K is ample headroom for a full briefing.
+    with client.messages.stream(
         model="claude-opus-4-8",
-        max_tokens=8192,
+        max_tokens=32000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
-    )
+    ) as stream:
+        message = stream.get_final_message()
+    if message.stop_reason == "max_tokens":
+        log.warning("Briefing hit max_tokens (32000) — output may be truncated.")
     html = message.content[0].text
     m = re.search(r'<!--\s*SUBJECT:\s*(.+?)\s*-->', html)
     subject = m.group(1).strip() if m else f"Gus's Morning Briefing - {datetime.utcnow().strftime('%B %-d, %Y')}"
