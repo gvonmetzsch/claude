@@ -48,6 +48,13 @@ on:
         type: boolean
         default: false
 
+# Serialize runs: the many overlapping cron triggers must not run at once, or two
+# could race the WHOOP rotating-refresh-token update and brick it. Queue, don't
+# cancel, so a run mid-token-rotation isn't killed before it persists the new token.
+concurrency:
+  group: morning-briefing
+  cancel-in-progress: false
+
 jobs:
   briefing:
     name: Generate and deliver morning briefing
@@ -75,5 +82,11 @@ jobs:
           GOOGLE_CLIENT_SECRET:   ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN:   ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           BRAVE_SEARCH_API_KEY:   ${{ secrets.BRAVE_SEARCH_API_KEY }}
+          WHOOP_CLIENT_ID:        ${{ secrets.WHOOP_CLIENT_ID }}
+          WHOOP_CLIENT_SECRET:    ${{ secrets.WHOOP_CLIENT_SECRET }}
+          WHOOP_REFRESH_TOKEN:    ${{ secrets.WHOOP_REFRESH_TOKEN }}
+          GH_SECRETS_PAT:         ${{ secrets.GH_SECRETS_PAT }}
+          GOOGLE_KEEP_EMAIL:        ${{ secrets.GOOGLE_KEEP_EMAIL }}
+          GOOGLE_KEEP_MASTER_TOKEN: ${{ secrets.GOOGLE_KEEP_MASTER_TOKEN }}
           FORCE_SEND:             ${{ inputs.force_send }}
         run: python briefing/generate_briefing.py
