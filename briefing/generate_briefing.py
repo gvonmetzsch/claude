@@ -616,7 +616,7 @@ def fetch_keep_todos() -> dict | None:
 # wide receive-window is necessary — the event-date filtering happens in-prompt.)
 EVENT_EMAIL_LOOKBACK = "12m"   # Gmail newer_than: window
 EVENT_HORIZON_DAYS   = 7       # only surface events dated today .. +N days
-EVENT_MAX_CANDIDATES = 150     # cap messages fetched (bounds latency + tokens)
+EVENT_MAX_CANDIDATES = 300     # cap messages fetched (bounds latency + tokens)
 
 # High-precision sources: ticketing, airlines/rail, lodging/travel, dining.
 _EVENT_SENDERS = [
@@ -681,6 +681,9 @@ def fetch_email_events(gmail_service) -> list[dict]:
                 "snippet":  m.get("snippet", "")[:300],
             })
         log.info("Email-events scan: %d candidate messages.", len(out))
+        if len(out) >= EVENT_MAX_CANDIDATES:
+            log.warning("Email-events scan hit the %d candidate cap — older "
+                        "advance-purchase confirmations may be excluded.", EVENT_MAX_CANDIDATES)
         return out
     except Exception as exc:
         log.warning("Email-events scan failed: %s", exc)
