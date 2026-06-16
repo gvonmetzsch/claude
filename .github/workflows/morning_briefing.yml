@@ -1,46 +1,23 @@
 name: Morning Briefing
 
-# Runs at 6:45 AM across all timezones Gus is likely to be in.
-# The Python script deduplicates — only one briefing fires per day
-# (whichever cron trigger lands within the 6:45 AM local window).
+# Fires every 15 minutes, 24/7. GitHub's scheduled triggers are best-effort and
+# routinely delayed or dropped entirely under load — so instead of hand-placing
+# per-timezone cron times (which leaves long gaps where a single dropped event
+# means NO briefing that day), we run on a dense regular interval and let the
+# Python script decide when to actually send.
 #
-# Covered UTC offsets and their 6:45 AM local → UTC equivalent:
-#   PDT  (UTC-7)  → 13:45 UTC
-#   CDT  (UTC-6)  → 12:45 UTC   ← Mexico City
-#   EDT  (UTC-5)  → 11:45 UTC   ← Princeton / New York
-#   BST  (UTC+1)  → 05:45 UTC   ← London (summer)
-#   CEST (UTC+2)  → 04:45 UTC   ← Central Europe (summer)
-#   EEST (UTC+3)  → 03:45 UTC   ← Eastern Europe / Istanbul
-#   GST  (UTC+4)  → 02:45 UTC   ← Dubai
-#   SGT  (UTC+8)  → 22:45 UTC   (previous day — runs correctly)
-#   JST  (UTC+9)  → 21:45 UTC   (previous day)
-#
-# Each hour also fires a :15 backup run so a delayed GitHub schedule
-# still lands inside the morning send window. The script's dedup
-# guarantees only one email per day regardless of how many fire.
-#
-# To add a new timezone: compute UTC = 06:45 - offset, add a cron entry.
+# The script only sends when local time is inside the morning window
+# (6:45 AM → 11:00 AM, see is_briefing_window) AND it hasn't already sent today
+# (Gmail dedup). So:
+#   - Exactly one email per day, regardless of how many runs fire.
+#   - Works in ANY timezone automatically (no per-tz cron upkeep).
+#   - The ~4h window means ~17 firings land inside it; GitHub can drop most of
+#     them and one will still get through. The repo is PUBLIC, so the frequent
+#     short no-op runs (which exit in seconds) cost nothing.
 
 on:
   schedule:
-    - cron: '45 2  * * *'   # GST UTC+4 (Dubai)
-    - cron: '15 3  * * *'
-    - cron: '45 3  * * *'   # EEST UTC+3 (Eastern Europe)
-    - cron: '15 4  * * *'
-    - cron: '45 4  * * *'   # CEST UTC+2 (Central Europe)
-    - cron: '15 5  * * *'
-    - cron: '45 5  * * *'   # BST UTC+1 (London summer)
-    - cron: '15 6  * * *'
-    - cron: '45 6  * * *'   # UTC+0 (London winter / GMT)
-    - cron: '45 11 * * *'   # EDT UTC-5 (Princeton/NY)
-    - cron: '15 12 * * *'
-    - cron: '45 12 * * *'   # CDT UTC-6 (Mexico City, Chicago)
-    - cron: '15 13 * * *'
-    - cron: '45 13 * * *'   # PDT UTC-7 (Bay Area summer)
-    - cron: '15 14 * * *'
-    - cron: '45 14 * * *'   # PST UTC-8 (Bay Area winter)
-    - cron: '45 21 * * *'   # JST UTC+9 (Japan)
-    - cron: '45 22 * * *'   # SGT UTC+8 (Singapore / Hong Kong)
+    - cron: '*/15 * * * *'   # every 15 min, 24/7; script gates the actual send
   workflow_dispatch:         # Manual trigger for testing
     inputs:
       force_send:
