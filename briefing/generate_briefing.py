@@ -609,6 +609,84 @@ def fetch_keep_todos() -> dict | None:
         return None
 
 
+# ── Upcoming events/tickets scraped from email ──────────────────────────────
+# Tickets, travel, and reservations often arrive months before the event date,
+# so scan up to a year back, then let Claude keep only those dated within the
+# next-week horizon. (Gmail can filter by RECEIVED date, not EVENT date, so the
+# wide receive-window is necessary — the event-date filtering happens in-prompt.)
+EVENT_EMAIL_LOOKBACK = "12m"   # Gmail newer_than: window
+EVENT_HORIZON_DAYS   = 7       # only surface events dated today .. +N days
+EVENT_MAX_CANDIDATES = 150     # cap messages fetched (bounds latency + tokens)
+
+# High-precision sources: ticketing, airlines/rail, lodging/travel, dining.
+_EVENT_SENDERS = [
+    "ticketmaster.com", "livenation.com", "seatgeek.com", "axs.com",
+    "stubhub.com", "vividseats.com", "eventbrite.com", "dice.fm",
+    "ticketweb.com", "gametime.co", "etix.com",
+    "united.com", "delta.com", "aa.com", "southwest.com", "jetblue.com",
+    "alaskaair.com", "aeromexico.com", "volaris.com", "lufthansa.com",
+    "britishairways.com", "amtrak.com",
+    "expedia.com", "booking.com", "hotels.com", "airbnb.com", "vrbo.com",
+    "marriott.com", "hilton.com", "hyatt.com", "tripit.com", "kayak.com",
+    "opentable.com", "resy.com", "exploretock.com", "sevenrooms.com",
+]
+# High-signal phrases for ticket/travel/reservation mail from senders we didn't enumerate.
+_EVENT_KEYWORDS = [
+    '"your tickets"', '"e-ticket"', '"mobile ticket"', '"boarding pass"',
+    '"flight confirmation"', "itinerary", '"reservation confirmed"',
+    '"your reservation"', '"booking confirmation"', '"order confirmed"',
+    '"doors open"', '"you\'re going"',
+]
+
+
+def _build_event_query() -> str:
+    senders = " ".join(f"from:{d}" for d in _EVENT_SENDERS)
+    keywords = " ".join(_EVENT_KEYWORDS)
+    # {a b c} is Gmail's OR group. Promotions are kept IN — real ticket/order
+    # confirmations are frequently filed under that category.
+    return f"newer_than:{EVENT_EMAIL_LOOKBACK} {{{senders} {keywords}}}"
+
+
+def fetch_email_events(gmail_service) -> list[dict]:
+    """Scan up to ~12 months of ticket/travel/reservation email and return
+    lightweight candidates (subject/from/received/snippet). Claude extracts the
+    actual EVENT date and keeps only those within the next-week horizon. The
+    event date usually sits in the subject/snippet, so metadata format is enough
+    and we avoid pulling full bodies. Fail-soft → [] on any error."""
+    try:
+        q = _build_event_query()
+        ids, page_token = [], None
+        while len(ids) < EVENT_MAX_CANDIDATES:
+            resp = gmail_service.users().messages().list(
+                userId="me", q=q, maxResults=100, pageToken=page_token,
+            ).execute()
+            ids.extend(m["id"] for m in resp.get("messages", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        out = []
+        for mid in ids[:EVENT_MAX_CANDIDATES]:
+            try:
+                m = gmail_service.users().messages().get(
+                    userId="me", id=mid, format="metadata",
+                    metadataHeaders=["Subject", "From", "Date"],
+                ).execute()
+            except Exception:
+                continue
+            headers = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+            out.append({
+                "subject":  headers.get("Subject", ""),
+                "from":     headers.get("From", ""),
+                "received": headers.get("Date", ""),
+                "snippet":  m.get("snippet", "")[:300],
+            })
+        log.info("Email-events scan: %d candidate messages.", len(out))
+        return out
+    except Exception as exc:
+        log.warning("Email-events scan failed: %s", exc)
+        return []
+
+
 # ────────────────────────────── Main generation ────────────────────────────
 
 SYSTEM_PROMPT = """You are a sharp, concise AI assistant generating a personalized morning briefing email for August (Gus) von Metzsch.
@@ -623,7 +701,7 @@ Briefing rules:
 1. OPENING (lead the email with this, in order):
    a) A brief PROSE PARAGRAPH (a few sentences, warm personal-assistant tone) that weaves together: a SHORT retrospective WHOOP read (how recovery/strain have trended over yesterday and the past week, plus any notable workouts — keep it brief, and only mention last night's sleep if sleep data for last night is actually present), the day's todos at a high level (heavily weight the note titled "Tasks"; lightly fold in anything clearly todo-like skimmed from the other notes), and what today's calendar holds. If something from the rest of the briefing body is genuinely MAJOR, it may earn one sentence here too. Omit WHOOP or todos silently if their data is absent — never mention missing data.
    b) QUICK KEY TASKS: a tight bulleted list of the few most important/actionable todos (drawn mainly from "Tasks"). Skip if there are none.
-   c) CALENDAR: bullet points with brief prose within each — today's events with times, tasks with due dates. If the calendar is empty today, say so in ONE line. After today, add a very brief prose overview of the day, next week, and next month (1-2 sentences each, weighted by how much is happening).
+   c) CALENDAR & UPCOMING: bullet points with brief prose within each — today's events with times, tasks with due dates. If the calendar is empty today, say so in ONE line. After today, add a very brief prose overview of the day, next week, and next month (1-2 sentences each, weighted by how much is happening). Also fold in any EVENTS/TICKETS FROM EMAIL dated within the next week (concerts, games, flights, trips, hotel/restaurant reservations) that are NOT already on the calendar — list them like calendar items with their date/time and venue. A genuinely major one (a concert tonight, a flight today) may instead/also earn a mention in the opening paragraph (a). Only include an email-derived event if its date is clearly within the next week; never invent or guess a date.
 2. INBOX: Lead with time-sensitive items (deadlines, things awaiting a reply). One line per item with sender. SKIP newsletters here. Skip promotional/automated noise unless it has a clear action item (package/flight status, etc.). Sort by priority/action type, with a short 'potentially relevant' group at the end. No commentary on who emails are addressed to. If nothing substantial, say nothing about there being nothing.
 3. NEWS: Start from newsletter content, fill gaps with search results, preferring newsletter content. Priority order: world headlines (major items + maybe 1 niche cool one) -> 3 WSJ links (one macro, one company/industry, one op-ed; FT/Economist/NYT acceptable fallback) -> markets & macro -> M&A/PE/dealflow -> tech/AI -> athletics (lacrosse NCAA D1 + pro, football, golf, snow sports, hockey, basketball, baseball; bias Princeton, Bay Area, Boston): keep the brief prose coverage of notable storylines/news, THEN a real SCOREBOARD grouped BY SPORT. Under each sport (e.g. NHL, NBA, MLB, Lacrosse, Golf, Soccer), a tight text list of games with the ACTUAL final score — "matchup — final score" (e.g. "Oilers vs Panthers (Stanley Cup Final G5) — EDM 3-1", "Red Sox @ Yankees — BOS 6-3", "Giants @ Dodgers — LAD 4-2"). Lead each sport with Gus's teams (Princeton; Bay Area: Warriors/Giants/49ers/Sharks/A's; Boston: Celtics/Bruins/Red Sox), then include other notable/marquee results — finals & championship games (e.g. the Stanley Cup Final, NBA Finals), big upsets, and tournament leaders/standings. ALWAYS give the real score or standing; NEVER vague summaries like "Germany dominant" or "close game". Include more results rather than fewer, but only ones you're confident are real and current -> 3 unique niche cool things -> 3 learning points (>=1 on actionable tech/AI skill or workflow). Skip empty categories rather than padding. Tight, mostly bullets. Only include links you are confident are live.
 4. If any section/subsection is empty, skip it entirely with no mention (Calendar's 'empty today' one-liner is the only exception).
@@ -637,7 +715,7 @@ Briefing rules:
 
 
 def build_user_prompt(calendar_data, inbox_items, newsletters, news_results, tz_str,
-                      local_now, whoop_data=None, keep_todos=None):
+                      local_now, whoop_data=None, keep_todos=None, email_events=None):
     day = local_now.day
     suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
     date_str = local_now.strftime(f"%B %-d{suffix}, %Y")
@@ -662,8 +740,22 @@ def build_user_prompt(calendar_data, inbox_items, newsletters, news_results, tz_
                 'main focus, "other" notes are for a light skim)\n'
                 f"{json.dumps(keep_todos, indent=2, default=str)}\n")
 
+    parts.append(f"\n# CALENDAR DATA\n{json.dumps(calendar_data, indent=2, default=str)}\n")
+
+    # Events/tickets scraped from up to ~12 months of email. Claude must extract
+    # the actual EVENT date and keep only those within the next-week horizon,
+    # deduping against the calendar above.
+    if email_events:
+        parts.append(
+            f"\n# EVENTS/TICKETS FROM EMAIL (scanned ~{EVENT_EMAIL_LOOKBACK} of mail; tickets, travel, reservations)\n"
+            "# Each item is a confirmation email. EXTRACT the actual EVENT / travel / reservation date from the "
+            f"subject + snippet. USE ONLY items whose event date falls within TODAY..+{EVENT_HORIZON_DAYS} days. "
+            "Discard anything past, far in the future, undated, cancelled, or merely promotional. DEDUP against "
+            "CALENDAR DATA above — do not repeat events already on the calendar. Never invent a date; if you cannot "
+            "tell the event date confidently, drop the item.\n"
+            f"{json.dumps(email_events, indent=2)}\n")
+
     parts += [
-        f"\n# CALENDAR DATA\n{json.dumps(calendar_data, indent=2, default=str)}\n",
         f"\n# INBOX ITEMS (since last briefing)\n{json.dumps(inbox_items, indent=2)}\n",
         "\n# NEWSLETTER CONTENT (plain text, already stripped)\n",
     ]
@@ -835,9 +927,14 @@ def main():
     whoop_data = fetch_whoop_data()
     keep_todos = fetch_keep_todos()
 
+    # Scan up to ~12 months of email for tickets/travel/reservations dated in the
+    # next week (fail-soft → []). Runs only on send-eligible runs, like the above.
+    email_events = fetch_email_events(gmail_svc)
+
     user_prompt   = build_user_prompt(calendar_data, inbox_items, newsletters,
                                       news_results, tz_str, local_now,
-                                      whoop_data=whoop_data, keep_todos=keep_todos)
+                                      whoop_data=whoop_data, keep_todos=keep_todos,
+                                      email_events=email_events)
     subject, html = generate_html_briefing(user_prompt)
     send_email(gmail_svc, subject, html)
     log.info("Done.")
