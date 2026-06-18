@@ -309,6 +309,49 @@ def fetch_newsletter_body(gmail_service, thread_id: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()[:6000]
 
 
+def _message_plain_text(detail: dict) -> str:
+    """Plain text of a single Gmail message (prefers text/plain, else strips HTML)."""
+    def extract(payload):
+        mime = payload.get("mimeType", "")
+        if mime == "text/plain":
+            data = payload.get("body", {}).get("data", "")
+            return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="ignore")
+        if mime == "text/html":
+            data = payload.get("body", {}).get("data", "")
+            html = base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="ignore")
+            return re.sub(r'<[^>]+>', ' ', html)
+        for part in payload.get("parts", []):
+            r = extract(part)
+            if r:
+                return r
+        return ""
+    return re.sub(r'\s+', ' ', extract(detail.get("payload", {}))).strip()
+
+
+def fetch_recent_briefings_text(gmail_service, n: int = 2) -> list[str]:
+    """Plain text of the last n briefings already sent, so the model can avoid
+    repeating the same scores/headlines/storylines day over day. Fail-soft → []."""
+    try:
+        result = gmail_service.users().messages().list(
+            userId="me",
+            q=f'from:me to:{RECIPIENT} subject:"Morning Briefing"',
+            maxResults=n,
+        ).execute()
+        out = []
+        for m in result.get("messages", []):
+            detail = gmail_service.users().messages().get(
+                userId="me", id=m["id"], format="full"
+            ).execute()
+            txt = _message_plain_text(detail)
+            if txt:
+                out.append(txt[:6000])
+        log.info("Dedupe: loaded %d recent briefing(s).", len(out))
+        return out
+    except Exception as exc:
+        log.warning("Recent-briefings (dedupe) fetch failed: %s", exc)
+        return []
+
+
 def find_newsletter_threads(gmail_service, since_utc: datetime) -> dict[str, str]:
     since_str = since_utc.strftime("%Y/%m/%d")
     targets = {
@@ -388,6 +431,65 @@ def web_search(query: str, num: int = 5) -> list[dict]:
     except Exception as exc:
         log.warning("Brave search failed for '%s': %s", query, exc)
         return []
+
+
+# ── Authoritative sports scores (ESPN public scoreboard API, no key) ─────────
+# Brave snippets produced confidently-wrong scores (e.g. a fabricated upset), so
+# scores now come from ESPN's structured feed and the model is told to use them
+# verbatim and never invent a result. Scoped to yesterday→today (local) so each
+# briefing covers fresh games rather than restating the same ones.
+ESPN_SCOREBOARDS = {
+    "NBA":               "basketball/nba",
+    "NHL":               "hockey/nhl",
+    "MLB":               "baseball/mlb",
+    "World Cup":         "soccer/fifa.world",
+    "NCAA Lacrosse (M)": "lacrosse/mens-college-lacrosse",
+}
+
+
+def _parse_espn_event(ev: dict) -> dict:
+    comp  = (ev.get("competitions") or [{}])[0]
+    stype = (ev.get("status") or {}).get("type", {})
+    sides = {}
+    for c in comp.get("competitors", []):
+        team = c.get("team") or {}
+        sides[c.get("homeAway", "?")] = {
+            "team":   team.get("displayName") or team.get("abbreviation"),
+            "score":  c.get("score"),
+            "winner": c.get("winner"),
+        }
+    return {
+        "matchup": ev.get("shortName") or ev.get("name"),
+        "date":    ev.get("date"),
+        "state":   stype.get("state"),                       # pre | in | post
+        "status":  stype.get("shortDetail") or stype.get("description"),
+        "home":    sides.get("home"),
+        "away":    sides.get("away"),
+    }
+
+
+def fetch_espn_scores(local_now) -> dict:
+    """Real scores (final + in-progress) from ESPN, scoped to yesterday→today
+    local. Per-league fail-soft; returns {} if nothing/everything errors."""
+    yday  = (local_now - timedelta(days=1)).strftime("%Y%m%d")
+    today = local_now.strftime("%Y%m%d")
+    dates = f"{yday}-{today}"
+    out = {}
+    for label, path in ESPN_SCOREBOARDS.items():
+        try:
+            resp = requests.get(
+                f"https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard",
+                params={"dates": dates}, timeout=10,
+            )
+            resp.raise_for_status()
+            games = [_parse_espn_event(e) for e in resp.json().get("events", [])]
+            games = [g for g in games if g.get("state") in ("in", "post")]  # drop not-yet-played
+            if games:
+                out[label] = games
+        except Exception as exc:
+            log.warning("ESPN scores failed for %s: %s", label, exc)
+    log.info("ESPN scores: %s", {k: len(v) for k, v in out.items()})
+    return out
 
 
 # ──────────────────────────────────── WHOOP ─────────────────────────────────
@@ -706,7 +808,7 @@ Briefing rules:
    b) QUICK KEY TASKS: a tight bulleted list of the few most important/actionable todos (drawn mainly from "Tasks"). Skip if there are none.
    c) CALENDAR & UPCOMING: bullet points with brief prose within each — today's events with times, tasks with due dates. If the calendar is empty today, say so in ONE line. After today, add a very brief prose overview of the day, next week, and next month (1-2 sentences each, weighted by how much is happening). Also fold in any EVENTS/TICKETS FROM EMAIL dated within the next week (concerts, games, flights, trips, hotel/restaurant reservations) that are NOT already on the calendar — list them like calendar items with their date/time and venue. A genuinely major one (a concert tonight, a flight today) may instead/also earn a mention in the opening paragraph (a). Only include an email-derived event if its date is clearly within the next week; never invent or guess a date.
 2. INBOX: Lead with time-sensitive items (deadlines, things awaiting a reply). One line per item with sender. SKIP newsletters here. Skip promotional/automated noise unless it has a clear action item (package/flight status, etc.). Sort by priority/action type, with a short 'potentially relevant' group at the end. No commentary on who emails are addressed to. If nothing substantial, say nothing about there being nothing.
-3. NEWS: Start from newsletter content, fill gaps with search results, preferring newsletter content. Priority order: world headlines (major items + maybe 1 niche cool one) -> 3 WSJ links (one macro, one company/industry, one op-ed; FT/Economist/NYT acceptable fallback) -> markets & macro -> M&A/PE/dealflow -> tech/AI -> athletics (lacrosse NCAA D1 + pro, football, golf, snow sports, hockey, basketball, baseball; bias Princeton, Bay Area, Boston): keep the brief prose coverage of notable storylines/news, THEN a real SCOREBOARD grouped BY SPORT. Under each sport (e.g. NHL, NBA, MLB, Lacrosse, Golf, Soccer), a tight text list of games with the ACTUAL final score — "matchup — final score" (e.g. "Oilers vs Panthers (Stanley Cup Final G5) — EDM 3-1", "Red Sox @ Yankees — BOS 6-3", "Giants @ Dodgers — LAD 4-2"). Lead each sport with Gus's teams (Princeton; Bay Area: Warriors/Giants/49ers/Sharks/A's; Boston: Celtics/Bruins/Red Sox), then include other notable/marquee results — finals & championship games (e.g. the Stanley Cup Final, NBA Finals), big upsets, and tournament leaders/standings. ALWAYS give the real score or standing; NEVER vague summaries like "Germany dominant" or "close game". Include more results rather than fewer, but only ones you're confident are real and current -> 3 unique niche cool things -> 3 learning points (>=1 on actionable tech/AI skill or workflow). Skip empty categories rather than padding. Tight, mostly bullets. Only include links you are confident are live.
+3. NEWS: Start from newsletter content, fill gaps with search results, preferring newsletter content. DEDUPE (critical): do NOT repeat any score, headline, or storyline that already appeared in the ALREADY REPORTED IN RECENT BRIEFINGS section — surface only NEW developments; ongoing items (series standings, tournaments in progress) may be updated with what changed but never restated unchanged. Priority order: world headlines (major items + maybe 1 niche cool one) -> 3 WSJ links (one macro, one company/industry, one op-ed; FT/Economist/NYT acceptable fallback) -> markets & macro -> M&A/PE/dealflow -> tech/AI -> athletics (lacrosse NCAA D1 + pro, football, golf, snow sports, hockey, basketball, baseball; bias Princeton, Bay Area, Boston): keep the brief prose coverage of notable storylines/news, THEN a real SCOREBOARD grouped BY SPORT. Under each sport (e.g. NHL, NBA, MLB, Lacrosse, Golf, Soccer), a tight text list of games with the ACTUAL final score — "matchup — final score" (e.g. "Oilers vs Panthers (Stanley Cup Final G5) — EDM 3-1", "Red Sox @ Yankees — BOS 6-3", "Giants @ Dodgers — LAD 4-2"). Lead each sport with Gus's teams (Princeton; Bay Area: Warriors/Giants/49ers/Sharks/A's; Boston: Celtics/Bruins/Red Sox), then include other notable/marquee results — finals & championship games (e.g. the Stanley Cup Final, NBA Finals), big upsets, and tournament leaders/standings. Scores MUST be taken verbatim from the REAL SPORTS SCORES (ESPN) section — never from news snippets, prior knowledge, or inference. If a game is NOT in that data, do not report a score for it (you may mention the matchup as upcoming or result-pending from the news, but NEVER fabricate the outcome or winner). ALWAYS give the exact real score; NEVER vague summaries like "Germany dominant" or "close game". Include all relevant results that are present in the data (Gus's teams first, then other notable/marquee results), and skip a sport entirely if the data has nothing new for it -> 3 unique niche cool things -> 3 learning points (>=1 on actionable tech/AI skill or workflow). Skip empty categories rather than padding. Tight, mostly bullets. Only include links you are confident are live.
 4. If any section/subsection is empty, skip it entirely with no mention (Calendar's 'empty today' one-liner is the only exception).
 5. FORMATTING — output ONLY the HTML email body (no DOCTYPE/html/head; just the visible content starting with a wrapper table). Hard requirements:
    - Table-based layout only (nested <table>; no <div> for structure). ALL CSS inline. No <style> block, no JS, no external resources, no web fonts. Web-safe fonts only: Arial/Helvetica for everything, Courier New ONLY for small uppercase section labels.
@@ -718,7 +820,8 @@ Briefing rules:
 
 
 def build_user_prompt(calendar_data, inbox_items, newsletters, news_results, tz_str,
-                      local_now, whoop_data=None, keep_todos=None, email_events=None):
+                      local_now, whoop_data=None, keep_todos=None, email_events=None,
+                      espn_scores=None, recent_briefings=None):
     day = local_now.day
     suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
     date_str = local_now.strftime(f"%B %-d{suffix}, %Y")
@@ -764,9 +867,28 @@ def build_user_prompt(calendar_data, inbox_items, newsletters, news_results, tz_
     ]
     for name, text in newsletters.items():
         parts.append(f"\n## {name}\n{text[:4000]}\n")
-    parts.append("\n# WEB SEARCH NEWS RESULTS (use to fill gaps only)\n")
+    parts.append("\n# WEB SEARCH NEWS RESULTS (use to fill gaps only; NOT a source of sports scores)\n")
     for topic, results in news_results.items():
         parts.append(f"\n## {topic}\n{json.dumps(results, indent=2)}\n")
+
+    # Authoritative scores — the model must use these verbatim and never invent one.
+    if espn_scores:
+        parts.append(
+            "\n# REAL SPORTS SCORES (AUTHORITATIVE — ESPN; yesterday→today)\n"
+            "# This is the ONLY valid source for the scoreboard. 'state': post=final, in=live. Report each score "
+            "EXACTLY as given (home vs away with their numeric scores). NEVER state a score or winner that is not "
+            "in this data; if a game from the news isn't here, do NOT invent its result.\n"
+            f"{json.dumps(espn_scores, indent=2, default=str)}\n")
+
+    # Dedupe — what was already sent, so today surfaces only new developments.
+    if recent_briefings:
+        joined = "\n\n--- PRIOR BRIEFING ---\n".join(recent_briefings)
+        parts.append(
+            "\n# ALREADY REPORTED IN RECENT BRIEFINGS (do NOT repeat)\n"
+            "# Your last briefings, verbatim text. Do NOT restate the same game scores, headlines, or storylines "
+            "that already appear here — surface only NEW results and NEW news. Ongoing items (a playoff series, a "
+            "tournament in progress) may be UPDATED with new developments but never repeated unchanged.\n"
+            f"{joined}\n")
 
     p = PALETTE
     parts.append(f"""
@@ -934,10 +1056,16 @@ def main():
     # next week (fail-soft → []). Runs only on send-eligible runs, like the above.
     email_events = fetch_email_events(gmail_svc)
 
+    # Authoritative scores (real, date-scoped) + last 2 briefings for dedupe.
+    espn_scores      = fetch_espn_scores(local_now)
+    recent_briefings = fetch_recent_briefings_text(gmail_svc, n=2)
+
     user_prompt   = build_user_prompt(calendar_data, inbox_items, newsletters,
                                       news_results, tz_str, local_now,
                                       whoop_data=whoop_data, keep_todos=keep_todos,
-                                      email_events=email_events)
+                                      email_events=email_events,
+                                      espn_scores=espn_scores,
+                                      recent_briefings=recent_briefings)
     subject, html = generate_html_briefing(user_prompt)
     send_email(gmail_svc, subject, html)
     log.info("Done.")
