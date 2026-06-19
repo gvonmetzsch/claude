@@ -203,16 +203,30 @@ def is_briefing_window(tz_str: str) -> tuple[bool, datetime]:
 # ─────────────────────────────── Gmail helpers ─────────────────────────────
 
 def already_sent_today(gmail_service, tz_str: str) -> bool:
-    """Check if a briefing was already sent to self today (avoid double-send).
-    Uses the inferred local date so the 'day' matches the user's wall clock."""
+    """Whether a briefing was already sent SINCE LOCAL MIDNIGHT today.
+
+    Gmail's `after:` search is date-only and timezone-fuzzy, so an email sent
+    late last night (which is the NEXT day in UTC) can be mis-counted as "today"
+    and silently suppress the morning briefing. So we filter coarsely with
+    `after:` (padded a day) and then confirm precisely using each message's
+    internalDate against local midnight."""
     tz = pytz.timezone(tz_str)
-    today_str = datetime.now(tz).strftime("%Y/%m/%d")
+    local_midnight = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff_utc = local_midnight.astimezone(timezone.utc)
+    coarse = (local_midnight - timedelta(days=1)).strftime("%Y/%m/%d")
     result = gmail_service.users().messages().list(
         userId="me",
-        q=f'from:me to:{RECIPIENT} subject:"Morning Briefing" after:{today_str}',
-        maxResults=1,
+        q=f'from:me to:{RECIPIENT} subject:"Morning Briefing" after:{coarse}',
+        maxResults=5,
     ).execute()
-    return bool(result.get("messages"))
+    for m in result.get("messages", []):
+        detail = gmail_service.users().messages().get(
+            userId="me", id=m["id"], format="minimal",
+        ).execute()
+        sent = datetime.fromtimestamp(int(detail.get("internalDate", "0")) / 1000, tz=timezone.utc)
+        if sent >= cutoff_utc:
+            return True
+    return False
 
 
 def compute_lookback_hours(gmail_service, tz_str: str) -> float:
