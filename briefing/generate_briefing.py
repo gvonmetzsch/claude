@@ -819,13 +819,18 @@ Briefing rules:
 """
 
 
+def briefing_subject(local_now) -> str:
+    """Subject line dated by the recipient's LOCAL day (never UTC), so e.g. at
+    UTC+8 the morning briefing reads the local date, not the prior UTC day."""
+    day = local_now.day
+    suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"Gus's Morning Briefing - {local_now.strftime(f'%B %-d{suffix}, %Y')}"
+
+
 def build_user_prompt(calendar_data, inbox_items, newsletters, news_results, tz_str,
                       local_now, whoop_data=None, keep_todos=None, email_events=None,
                       espn_scores=None, recent_briefings=None):
-    day = local_now.day
-    suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
-    date_str = local_now.strftime(f"%B %-d{suffix}, %Y")
-    subject = f"Gus's Morning Briefing - {date_str}"
+    subject = briefing_subject(local_now)
 
     parts = [
         f"# SUBJECT LINE\n{subject}\n",
@@ -931,7 +936,7 @@ All CSS inline. No <style> block, no external resources, no web fonts, no JS. Co
     return "".join(parts)
 
 
-def generate_html_briefing(user_prompt: str) -> tuple[str, str]:
+def generate_html_briefing(user_prompt: str, local_now) -> tuple[str, str]:
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     # Stream a large max_tokens: the inline-CSS table HTML is token-heavy, so an
     # 8K cap truncated the email mid-tag. claude-opus-4-8 allows up to 128K output
@@ -948,7 +953,7 @@ def generate_html_briefing(user_prompt: str) -> tuple[str, str]:
         log.warning("Briefing hit max_tokens (32000) — output may be truncated.")
     html = message.content[0].text
     m = re.search(r'<!--\s*SUBJECT:\s*(.+?)\s*-->', html)
-    subject = m.group(1).strip() if m else f"Gus's Morning Briefing - {datetime.utcnow().strftime('%B %-d, %Y')}"
+    subject = m.group(1).strip() if m else briefing_subject(local_now)
     return subject, html
 
 
@@ -1066,7 +1071,7 @@ def main():
                                       email_events=email_events,
                                       espn_scores=espn_scores,
                                       recent_briefings=recent_briefings)
-    subject, html = generate_html_briefing(user_prompt)
+    subject, html = generate_html_briefing(user_prompt, local_now)
     send_email(gmail_svc, subject, html)
     log.info("Done.")
 
