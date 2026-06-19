@@ -1072,4 +1072,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # This runs every ~10 minutes (Cloud Scheduler). A hard crash would otherwise
+    # produce a GitHub "run failed" email on EVERY tick (e.g. when GOOGLE_REFRESH_TOKEN
+    # expires). So swallow unexpected errors, log the full traceback, and exit 0.
+    # The intentional early exits inside main() raise SystemExit (not Exception),
+    # so the window/dedup guards still short-circuit normally. A genuinely broken
+    # pipeline now surfaces as a MISSING briefing (catch it with a dead-man's-switch),
+    # not as inbox spam — and transient failures self-heal on the next 10-min tick.
+    try:
+        main()
+    except Exception:
+        log.exception("Briefing run failed; exiting 0 to avoid failure-email spam "
+                      "on the 10-minute schedule.")
+        sys.exit(0)
