@@ -65,5 +65,8 @@ jobs:
           GH_SECRETS_PAT:         ${{ secrets.GH_SECRETS_PAT }}
           GOOGLE_KEEP_EMAIL:        ${{ secrets.GOOGLE_KEEP_EMAIL }}
           GOOGLE_KEEP_MASTER_TOKEN: ${{ secrets.GOOGLE_KEEP_MASTER_TOKEN }}
+          # Manual timezone override for travel (IANA name, e.g. Europe/London).
+          # Set/clear via: gh variable set BRIEFING_TZ -R gvonmetzsch/claude --body "Europe/London"
+          BRIEFING_TZ:            ${{ vars.BRIEFING_TZ }}
           FORCE_SEND:             ${{ inputs.force_send }}
         run: python briefing/generate_briefing.py

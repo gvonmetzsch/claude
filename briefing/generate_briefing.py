@@ -151,9 +151,21 @@ def build_google_credentials() -> Credentials:
 
 def infer_timezone(calendar_service) -> str:
     """
-    Infer current timezone from the destination of the most recent past flight
-    in Google Calendar. Falls back to calendar's default timezone.
+    Determine the recipient's current timezone, in priority order:
+      1. BRIEFING_TZ manual override (an IANA name like "Europe/London") — set
+         this when traveling; flight inference is too fragile to depend on.
+      2. Destination of the most recent past flight in Google Calendar.
+      3. The primary calendar's default timezone.
     """
+    override = os.environ.get("BRIEFING_TZ", "").strip()
+    if override:
+        try:
+            pytz.timezone(override)            # validate
+            log.info("Using BRIEFING_TZ override: %s", override)
+            return override
+        except Exception:
+            log.warning("BRIEFING_TZ '%s' is not a valid IANA timezone — ignoring.", override)
+
     now_utc = datetime.now(timezone.utc)
     two_months_ago = (now_utc - timedelta(days=60)).isoformat()
 
