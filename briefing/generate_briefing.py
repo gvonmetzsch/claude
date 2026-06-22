@@ -151,11 +151,12 @@ def build_google_credentials() -> Credentials:
 
 def infer_timezone(calendar_service) -> str:
     """
-    Determine the recipient's current timezone, in priority order:
-      1. BRIEFING_TZ manual override (an IANA name like "Europe/London") — set
-         this when traveling; flight inference is too fragile to depend on.
-      2. Destination of the most recent past flight in Google Calendar.
-      3. The primary calendar's default timezone.
+    Determine the recipient's current timezone from the PRIMARY Google Calendar's
+    timezone setting — so you control send-time by changing your calendar's time
+    zone (Google Calendar → Settings → General → Time zone), no CLI needed.
+
+    A BRIEFING_TZ override (IANA name) still wins if ever set, as an escape hatch;
+    normally it's unset and the calendar setting is the single source of truth.
     """
     override = os.environ.get("BRIEFING_TZ", "").strip()
     if override:
@@ -166,40 +167,13 @@ def infer_timezone(calendar_service) -> str:
         except Exception:
             log.warning("BRIEFING_TZ '%s' is not a valid IANA timezone — ignoring.", override)
 
-    now_utc = datetime.now(timezone.utc)
-    two_months_ago = (now_utc - timedelta(days=60)).isoformat()
-
     try:
-        result = calendar_service.events().list(
-            calendarId="primary",
-            timeMin=two_months_ago,
-            timeMax=now_utc.isoformat(),
-            maxResults=50,
-            singleEvents=True,
-            orderBy="startTime",
-            q="flight",
-        ).execute()
-
-        events = result.get("items", [])
-        for event in reversed(events):
-            title = event.get("summary", "")
-            desc  = event.get("description", "")
-            text  = f"{title} {desc}"
-            if not FLIGHT_KEYWORDS.search(text):
-                continue
-            codes = AIRPORT_RE.findall(text)
-            for code in reversed(codes):
-                if code in AIRPORT_TZ:
-                    log.info("Inferred timezone from flight to %s: %s", code, AIRPORT_TZ[code])
-                    return AIRPORT_TZ[code]
-
         cal_meta = calendar_service.calendars().get(calendarId="primary").execute()
         tz = cal_meta.get("timeZone", "America/New_York")
-        log.info("No flight found — using calendar default timezone: %s", tz)
+        log.info("Using primary calendar timezone: %s", tz)
         return tz
-
     except Exception as exc:
-        log.warning("Timezone inference failed: %s — defaulting to America/New_York", exc)
+        log.warning("Calendar timezone lookup failed: %s — defaulting to America/New_York", exc)
         return "America/New_York"
 
 
