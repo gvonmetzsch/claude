@@ -574,11 +574,24 @@ def _whoop_get(path: str, headers: dict, params: dict | None = None) -> dict:
     return resp.json()
 
 
-def fetch_whoop_data() -> dict | None:
+def _relative_day(date_str: str, today) -> str:
+    """'today' / 'yesterday' / 'N days ago' for a YYYY-MM-DD string vs local today."""
+    try:
+        d = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+        delta = (today - d).days
+        if delta <= 0:
+            return "today"
+        return "yesterday" if delta == 1 else f"{delta} days ago"
+    except Exception:
+        return ""
+
+
+def fetch_whoop_data(local_now) -> dict | None:
     """Pull a retrospective ~7-day WHOOP snapshot (recovery trend, recent sleep,
     daily strain, notable workouts). The briefing usually fires before the user
-    has woken up, so last night's sleep may not exist yet — we pull history and
-    treat last night as 'include if present'. Fail-soft: returns None on error."""
+    has woken up, so the most recent recovery is typically YESTERDAY's, not
+    today's — every record carries a 'when' label (today/yesterday/N days ago)
+    so the briefing attributes it correctly. Fail-soft: returns None on error."""
     if not all(os.environ.get(k) for k in
                ("WHOOP_CLIENT_ID", "WHOOP_CLIENT_SECRET", "WHOOP_REFRESH_TOKEN")):
         return None
@@ -591,6 +604,7 @@ def fetch_whoop_data() -> dict | None:
         window = {"start": start, "end": end, "limit": 25}
 
         data: dict = {}
+        local_today = local_now.date()
 
         def safe(label, fn):
             try:
@@ -605,8 +619,10 @@ def fetch_whoop_data() -> dict | None:
             recs = []
             for r in rec.get("records", []):
                 s = r.get("score") or {}
+                date = r.get("created_at", "")[:10]
                 recs.append({
-                    "date": r.get("created_at", "")[:10],
+                    "date": date,
+                    "when": _relative_day(date, local_today),
                     "recovery_score": s.get("recovery_score"),
                     "hrv_ms": s.get("hrv_rmssd_milli"),
                     "resting_hr": s.get("resting_heart_rate"),
@@ -624,8 +640,10 @@ def fetch_whoop_data() -> dict | None:
                 in_bed_ms = (stage.get("total_in_bed_time_milli") or 0)
                 awake_ms = (stage.get("total_awake_time_milli") or 0)
                 hours = round(max(in_bed_ms - awake_ms, 0) / 3_600_000, 1) or None
+                date = r.get("end", "")[:10]
                 sleeps.append({
-                    "date": r.get("end", "")[:10],
+                    "date": date,
+                    "when": _relative_day(date, local_today),
                     "performance_pct": s.get("sleep_performance_percentage"),
                     "efficiency_pct": s.get("sleep_efficiency_percentage"),
                     "hours": hours,
@@ -656,7 +674,10 @@ def fetch_whoop_data() -> dict | None:
                 })
             data["workouts_week"] = workouts
 
-        return data or None
+        if not data:
+            return None
+        data["as_of_local_date"] = local_now.strftime("%Y-%m-%d")
+        return data
     except Exception as exc:
         log.warning("WHOOP fetch failed: %s", exc)
         return None
@@ -804,7 +825,7 @@ About Gus:
 
 Briefing rules:
 1. OPENING (lead the email with this, in order):
-   a) A brief PROSE PARAGRAPH (a few sentences, warm personal-assistant tone) that weaves together: a SHORT retrospective WHOOP read (how recovery/strain have trended over yesterday and the past week, plus any notable workouts — keep it brief, and only mention last night's sleep if sleep data for last night is actually present), the day's todos at a high level (heavily weight the note titled "Tasks"; lightly fold in anything clearly todo-like skimmed from the other notes), and what today's calendar holds. If something from the rest of the briefing body is genuinely MAJOR, it may earn one sentence here too. Omit WHOOP or todos silently if their data is absent — never mention missing data.
+   a) A brief PROSE PARAGRAPH (a few sentences, warm personal-assistant tone) that weaves together: a SHORT retrospective WHOOP read (how recovery/strain have trended over yesterday and the past week, plus any notable workouts — keep it brief). This briefing runs BEFORE Gus wakes, so attribute each WHOOP figure to its actual day via the 'when' label: the most recent recovery is almost always YESTERDAY's — say "yesterday's recovery was X%", NOT "this morning's". Only call something "this morning"/"last night" if its 'when' is 'today', the day's todos at a high level (heavily weight the note titled "Tasks"; lightly fold in anything clearly todo-like skimmed from the other notes), and what today's calendar holds. If something from the rest of the briefing body is genuinely MAJOR, it may earn one sentence here too. Omit WHOOP or todos silently if their data is absent — never mention missing data.
    b) QUICK KEY TASKS: a tight bulleted list of the few most important/actionable todos (drawn mainly from "Tasks"). Skip if there are none.
    c) CALENDAR & UPCOMING: bullet points with brief prose within each — today's events with times, tasks with due dates. If the calendar is empty today, say so in ONE line. After today, add a very brief prose overview of the day, next week, and next month (1-2 sentences each, weighted by how much is happening). Also fold in any EVENTS/TICKETS FROM EMAIL dated within the next week (concerts, games, flights, trips, hotel/restaurant reservations) that are NOT already on the calendar — list them like calendar items with their date/time and venue. A genuinely major one (a concert tonight, a flight today) may instead/also earn a mention in the opening paragraph (a). Only include an email-derived event if its date is clearly within the next week; never invent or guess a date.
 2. INBOX: Lead with time-sensitive items (deadlines, things awaiting a reply). One line per item with sender. SKIP newsletters here. Skip promotional/automated noise unless it has a clear action item (package/flight status, etc.). Sort by priority/action type, with a short 'potentially relevant' group at the end. No commentary on who emails are addressed to. If nothing substantial, say nothing about there being nothing.
@@ -842,8 +863,12 @@ def build_user_prompt(calendar_data, inbox_items, newsletters, news_results, tz_
         parts.append("\n# OPENING INPUTS (for the opening paragraph + key tasks)\n")
         if whoop_data:
             parts.append(
-                "\n## WHOOP (retrospective ~7 days; usually no last-night sleep yet — "
-                "summarize trends, mention last night only if present)\n"
+                "\n## WHOOP (retrospective ~7 days). CRITICAL: this runs BEFORE Gus wakes, so "
+                "'latest_recovery' is almost always YESTERDAY's, not this morning's. Each record has a "
+                "'when' field (today/yesterday/N days ago) and there is an 'as_of_local_date' — attribute "
+                "every figure to its actual day using 'when'. NEVER call a recovery/sleep number 'this "
+                "morning's' unless its 'when' is literally 'today'. Summarize trends; mention last night's "
+                "sleep only if a record's 'when' is 'today'.\n"
                 f"{json.dumps(whoop_data, indent=2, default=str)}\n")
         if keep_todos:
             parts.append(
@@ -1054,7 +1079,7 @@ def main():
     # Opening-section data (both fail-soft → None on any error). WHOOP refreshes a
     # rotating token, so it runs here — past the window/dedup guards — i.e. only on
     # send-eligible runs, ~once/day. Keep is last (slow full sync, most fragile).
-    whoop_data = fetch_whoop_data()
+    whoop_data = fetch_whoop_data(local_now)
     keep_todos = fetch_keep_todos()
 
     # Scan up to ~12 months of email for tickets/travel/reservations dated in the
