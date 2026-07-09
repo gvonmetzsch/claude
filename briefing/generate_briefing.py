@@ -433,6 +433,46 @@ def web_search(query: str, num: int = 3) -> list[dict]:
         return []
 
 
+# ── Markets & finance reading (WSJ public RSS — real article deep-links) ─────
+# Brave search returned generic trending news (Fox/DailyMail/BBC) for finance
+# queries and never real wsj.com articles, so the "WSJ" section had nothing good
+# to cite. WSJ publishes free RSS feeds of actual article URLs — use those.
+WSJ_RSS_FEEDS = {
+    "Markets":  "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+    "Business": "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",
+    "Opinion":  "https://feeds.a.dj.com/rss/RSSOpinion.xml",
+}
+
+
+def fetch_wsj_finance_reading(max_per_feed: int = 5) -> list[dict]:
+    """Real WSJ article deep-links from WSJ's public RSS feeds (Markets/Business/
+    Opinion) for the finance-reading section. Returns [{section,title,url,
+    description}]. Fail-soft → [] (better empty than fabricated)."""
+    import xml.etree.ElementTree as ET
+    out = []
+    for section, url in WSJ_RSS_FEEDS.items():
+        try:
+            resp = requests.get(url, timeout=10,
+                                headers={"User-Agent": "morning-briefing/1.0"})
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            for item in root.findall(".//item")[:max_per_feed]:
+                link = (item.findtext("link") or "").strip()
+                if not link.startswith("http"):
+                    continue
+                desc = re.sub(r"<[^>]+>", "", item.findtext("description") or "").strip()
+                out.append({
+                    "section": section,
+                    "title": (item.findtext("title") or "").strip(),
+                    "url": link,
+                    "description": desc[:200],
+                })
+        except Exception as exc:
+            log.warning("WSJ RSS fetch failed for %s: %s", section, exc)
+    log.info("WSJ finance reading: %d real article links from RSS.", len(out))
+    return out
+
+
 # ── Authoritative sports scores (ESPN public scoreboard API, no key) ─────────
 # Brave snippets produced confidently-wrong scores (e.g. a fabricated upset), so
 # scores now come from ESPN's structured feed and the model is told to use them
@@ -1088,19 +1128,9 @@ def main():
         "Sports storylines":"NBA NHL MLB storylines Warriors Giants 49ers Sharks Celtics Bruins Red Sox",
     }
     news_results = {topic: web_search(q) for topic, q in news_queries.items()}
-    # Markets & finance reading (the "WSJ" section) — its purpose is helping Gus
-    # follow markets and learn finance, so pull MORE real article deep-links from
-    # top finance journalism. site:wsj.com forces genuine wsj.com article URLs;
-    # the second query supplements with FT/Bloomberg/Economist. The model must
-    # cite these URLs verbatim (never a homepage / never invented).
-    news_results["Markets & finance reading"] = (
-        web_search("site:wsj.com markets economy finance deals investing", num=6)
-        + web_search("markets macro finance analysis Financial Times Bloomberg Economist article today", num=6)
-    )
-    _fin = news_results["Markets & finance reading"]
-    log.info("Markets & finance reading: %d results, %d wsj.com, sample: %s",
-             len(_fin), sum(1 for r in _fin if "wsj.com" in (r.get("url") or "")),
-             [(r.get("url") or "")[:70] for r in _fin[:3]])
+    # Markets & finance reading (the "WSJ" section) comes from WSJ RSS, not Brave
+    # search — real WSJ article deep-links instead of generic trending news.
+    news_results["Markets & finance reading"] = fetch_wsj_finance_reading()
 
     # Opening-section data (both fail-soft → None on any error). WHOOP refreshes a
     # rotating token, so it runs here — past the window/dedup guards — i.e. only on
