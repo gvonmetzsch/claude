@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       force_send:
-        description: "Send a digest now, ignoring the quarterly window and dedup"
+        description: "Send a digest now, ignoring the quarterly window and send-dedup (reports already digested in a previous email are still skipped)"
         type: boolean
         default: false
 
@@ -32,7 +32,9 @@ jobs:
   digest:
     name: Collect, digest, and deliver electrical industry reports
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Headroom for ~40 collector fetches + up to 18 PDF downloads + 18
+    # sequential Claude calls; a runner kill would bypass all fail-soft handling.
+    timeout-minutes: 60
 
     steps:
       - name: Checkout

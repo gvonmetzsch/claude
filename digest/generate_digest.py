@@ -51,8 +51,10 @@ SUBJECT_PREFIX = "Electrical Industry Digest"
 # fully landed (reports publish ~3-10 weeks after quarter end):
 #   Mar → Q4/H2 crop,  Jun → Q1,  Sep → Q2/H1,  Dec → Q3.
 DIGEST_MONTHS = {3, 6, 9, 12}
-# Don't re-send if a digest already went out within this window.
-DEDUP_WINDOW_DAYS = 45
+# Don't re-send if a digest already went out within this window. Must cover
+# the 21-day cron window; kept short of a full quarter so a mid-quarter
+# force_send test doesn't suppress the next scheduled digest entirely.
+DEDUP_WINDOW_DAYS = 25
 
 # Skip editions published more than this many days ago (first-run sanity cap;
 # afterwards the manifest handles dedup). Editions without a detectable date
@@ -102,13 +104,29 @@ _session = requests.Session()
 _session.headers.update({"User-Agent": USER_AGENT})
 
 
+MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+
+
 def http_get(url: str, timeout: int = 40) -> requests.Response | None:
-    """GET with browser UA; returns None on any failure (fail-soft)."""
+    """GET with browser UA; returns None on any failure (fail-soft).
+    Streams with a hard byte cap so one misbehaving source can't balloon
+    the runner's memory."""
     try:
-        r = _session.get(url, timeout=timeout, allow_redirects=True)
-        if r.status_code == 200:
-            return r
-        log.info("GET %s -> %s", url, r.status_code)
+        r = _session.get(url, timeout=timeout, allow_redirects=True, stream=True)
+        if r.status_code != 200:
+            log.info("GET %s -> %s", url, r.status_code)
+            r.close()
+            return None
+        chunks, total = [], 0
+        for chunk in r.iter_content(chunk_size=1 << 20):
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_DOWNLOAD_BYTES:
+                log.info("GET %s exceeded %dMB — aborting.", url, MAX_DOWNLOAD_BYTES >> 20)
+                r.close()
+                return None
+        r._content = b"".join(chunks)  # make .content/.text/.json() work as usual
+        return r
     except Exception as exc:
         log.info("GET %s failed: %s", url, exc)
     return None
@@ -713,7 +731,9 @@ def _walk_message_text(payload: dict) -> str:
         data = part.get("body", {}).get("data")
         if data and part.get("mimeType", "").startswith("text/"):
             try:
-                chunks.append(base64.urlsafe_b64decode(data).decode("utf-8", "replace"))
+                # "==" pad: Gmail returns unpadded base64url (same fix as the
+                # briefing script; extra padding is ignored by the decoder).
+                chunks.append(base64.urlsafe_b64decode(data + "==").decode("utf-8", "replace"))
             except Exception:
                 pass
         for sub in part.get("parts", []) or []:
@@ -786,18 +806,30 @@ def build_google_credentials():
     return creds
 
 
+def _subject_is_digest(detail: dict) -> bool:
+    """True only for a digest the script generated — a forwarded or replied
+    copy gets a 'Fwd: '/'Re: ' prefix and must not count."""
+    for h in detail.get("payload", {}).get("headers", []):
+        if h.get("name", "").lower() == "subject":
+            return h.get("value", "").startswith(SUBJECT_PREFIX)
+    return False
+
+
 def already_sent_recently(gmail_service) -> bool:
     """Whether a digest went out within the dedup window (one send/quarter)."""
     coarse = (datetime.now(timezone.utc) - timedelta(days=DEDUP_WINDOW_DAYS)).strftime("%Y/%m/%d")
     result = gmail_service.users().messages().list(
         userId="me",
         q=f'from:me subject:"{SUBJECT_PREFIX}" after:{coarse}',
-        maxResults=3,
+        maxResults=5,
     ).execute()
     cutoff = datetime.now(timezone.utc) - timedelta(days=DEDUP_WINDOW_DAYS)
     for m in result.get("messages", []):
         detail = gmail_service.users().messages().get(
-            userId="me", id=m["id"], format="minimal").execute()
+            userId="me", id=m["id"], format="metadata",
+            metadataHeaders=["Subject"]).execute()
+        if not _subject_is_digest(detail):
+            continue
         sent = datetime.fromtimestamp(int(detail.get("internalDate", "0")) / 1000, tz=timezone.utc)
         if sent >= cutoff:
             return True
@@ -813,6 +845,8 @@ def fetch_last_manifest(gmail_service) -> set[str]:
         for m in result.get("messages", []):
             detail = gmail_service.users().messages().get(
                 userId="me", id=m["id"], format="full").execute()
+            if not _subject_is_digest(detail):
+                continue  # a forward/reply could carry a STALE manifest
             body = _walk_message_text(detail.get("payload", {}))
             match = re.search(r"DIGEST-MANIFEST-B64:\s*([A-Za-z0-9+/=]+)", body)
             if match:
@@ -851,9 +885,15 @@ def send_email(gmail_service, subject: str, html_body: str, recipients: list[str
         gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
         log.info("Digest sent: %s -> %s", subject, ", ".join(recipients))
     except Exception as exc:
-        log.warning("Send failed (%s) — saving draft instead.", exc)
-        gmail_service.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
-        log.info("Digest saved as draft.")
+        log.warning("Send failed (%s) — attempting draft fallback.", exc)
+        try:
+            # NOTE: drafts.create needs a compose/modify scope the token may
+            # not carry (it has gmail.send) — treat this as best-effort only.
+            gmail_service.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
+            log.info("Digest saved as draft.")
+        except Exception as exc2:
+            log.error("Draft fallback also failed (%s). Digest NOT delivered this run; "
+                      "the next cron tick will retry from scratch.", exc2)
 
 
 # ─────────────────────────── Claude digestion ───────────────────────────────
@@ -924,6 +964,11 @@ def summarize_report(client, ed: dict, usage_tally: dict) -> str | None:
             log.warning("Could not download %s — skipping.", ed["pdf_url"])
             return None
         pdf_bytes = r.content
+        if not pdf_bytes.startswith(b"%PDF"):
+            # A .pdf URL that now serves HTML (consent page, soft-404, bot wall).
+            log.warning("%s did not return a real PDF (magic bytes: %r) — skipping.",
+                        ed["pdf_url"], pdf_bytes[:8])
+            return None
         pages = _pdf_page_count(pdf_bytes)
         if len(pdf_bytes) <= PDF_NATIVE_MAX_BYTES and (pages is None or pages <= PDF_NATIVE_MAX_PAGES):
             content.append({
@@ -952,10 +997,11 @@ def summarize_report(client, ed: dict, usage_tally: dict) -> str | None:
 
     try:
         # Sonnet 5 runs adaptive thinking by default when `thinking` is omitted;
-        # that helps on dense report analysis. max_tokens covers thinking + text.
+        # that helps on dense report analysis. max_tokens covers thinking + text,
+        # so leave generous headroom or a long thinking phase truncates the answer.
         message = client.messages.create(
             model=MODEL,
-            max_tokens=8000,
+            max_tokens=16000,
             messages=[{"role": "user", "content": content}],
         )
     except Exception as exc:
@@ -963,7 +1009,14 @@ def summarize_report(client, ed: dict, usage_tally: dict) -> str | None:
         return None
     usage_tally["in"] += message.usage.input_tokens
     usage_tally["out"] += message.usage.output_tokens
-    return _first_text_block(message).strip() or None
+    if message.stop_reason == "max_tokens":
+        log.warning("Summary for %s hit max_tokens — may be truncated.", ed["title"])
+    text = _first_text_block(message).strip()
+    if not text:
+        log.warning("No text in Claude response for %s (stop_reason=%s) — skipping.",
+                    ed["title"], message.stop_reason)
+        return None
+    return text
 
 
 def _pdf_page_count(pdf_bytes: bytes) -> int | None:
@@ -1133,8 +1186,10 @@ def main():
                  MAX_REPORTS_PER_RUN, len(new_editions))
         new_editions = new_editions[:MAX_REPORTS_PER_RUN]
 
-    # 3. Digest each report with Claude.
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    # 3. Digest each report with Claude. Bound per-call stalls so 18 sequential
+    #    reports can't blow past the workflow timeout (SDK default is 10 min x3).
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"],
+                                 timeout=240.0, max_retries=1)
     usage = {"in": 0, "out": 0}
     summaries = []
     for ed in new_editions:
@@ -1156,9 +1211,10 @@ def main():
     log.info("Token usage: %d in / %d out — est. $%.4f (Sonnet 5 intro rates).",
              usage["in"], usage["out"], est)
 
-    # 5. Manifest = everything previously digested + what went out today
-    #    (successfully digested or not: a collected edition we chose to skip
-    #    would otherwise reappear forever — only failed downloads stay eligible).
+    # 5. Manifest = everything previously digested + what was successfully
+    #    summarized today. Editions that failed to download/summarize or were
+    #    cut by the per-run cap stay eligible and retry next quarter (until
+    #    the age filter retires them).
     sent_keys = set(old_keys) | {s["key"] for s in summaries}
     html = embed_manifest(html, list(sent_keys))
 
