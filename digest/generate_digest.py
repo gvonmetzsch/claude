@@ -28,7 +28,7 @@ import re
 import sys
 import logging
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import parsedate_to_datetime
@@ -47,10 +47,19 @@ SENDER = "gvonmetzsch@gmail.com"
 
 SUBJECT_PREFIX = "Electrical Industry Digest"
 
-# The digest fires in the months where the prior quarter's report crop has
-# fully landed (reports publish ~3-10 weeks after quarter end):
-#   Mar → Q4/H2 crop,  Jun → Q1,  Sep → Q2/H1,  Dec → Q3.
-DIGEST_MONTHS = {3, 6, 9, 12}
+# HARDCODED quarterly send dates (month, day). The digest goes out on the
+# first successful run ON or AFTER each date; the grace window lets the daily
+# cron retry if GitHub drops ticks. These are fixed calendar dates — test
+# sends and force_send runs never shift them.
+#
+# The dates sit ~2 months after each quarter closes because banks publish
+# their quarterly reports 3-10 weeks after quarter end:
+#   Mar 1 → Q4/H2 crop,  Jun 1 → Q1,  Sep 1 → Q2/H1,  Dec 1 → Q3.
+# (To send right after quarter close instead, change to (1,x),(4,x),(7,x),(10,x)
+#  — nothing is ever missed, but slow-publishing reports shift to the next
+#  digest. Keep the cron in report_digest.yml in sync with these dates.)
+DIGEST_SEND_DATES = [(3, 1), (6, 1), (9, 1), (12, 1)]
+SEND_GRACE_DAYS = 20
 # Don't re-send if a digest already went out within this window. Must cover
 # the 21-day cron window; kept short of a full quarter so a mid-quarter
 # force_send test doesn't suppress the next scheduled digest entirely.
@@ -1045,6 +1054,17 @@ def _pdf_extract_text(pdf_bytes: bytes) -> str:
         return ""
 
 
+def in_send_window(now_utc: datetime) -> bool:
+    """True when today falls on or within SEND_GRACE_DAYS after one of the
+    hardcoded DIGEST_SEND_DATES."""
+    today = now_utc.date()
+    for month, day in DIGEST_SEND_DATES:
+        target = date(today.year, month, day)
+        if 0 <= (today - target).days <= SEND_GRACE_DAYS:
+            return True
+    return False
+
+
 def quarter_label(now_utc: datetime) -> str:
     """The digest covers the PREVIOUS calendar quarter's report crop."""
     q = (now_utc.month - 1) // 3 + 1
@@ -1152,8 +1172,9 @@ def main():
     force = os.environ.get("FORCE_SEND", "").strip().lower() == "true"
     now = datetime.now(timezone.utc)
 
-    if not force and now.month not in DIGEST_MONTHS:
-        log.info("Not a digest month (%d). Exiting.", now.month)
+    if not force and not in_send_window(now):
+        log.info("Outside the hardcoded quarterly send windows (%s + %d-day grace). Exiting.",
+                 ", ".join(f"{m}/{d}" for m, d in DIGEST_SEND_DATES), SEND_GRACE_DAYS)
         sys.exit(0)
 
     if not force and already_sent_recently(gmail_svc):

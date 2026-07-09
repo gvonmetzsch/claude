@@ -14,12 +14,16 @@ Morning Briefing architecture.
 
 ## How it works
 
-1. **Guards** (skipped by `force_send`): only proceed in a digest month (Mar/Jun/Sep/Dec —
-   quarterly report crops land ~3-10 weeks after quarter end), and only if no digest was
-   sent in the last 45 days (Gmail search dedup). The GitHub cron fires daily through the
-   first 3 weeks of each digest month; the guards collapse this to exactly one send, which
-   makes GitHub's unreliable scheduler acceptable here (unlike the daily briefing, which
-   needs Cloud Scheduler).
+1. **Guards** (skipped by `force_send`): send dates are **hardcoded** in
+   `DIGEST_SEND_DATES` — Mar 1, Jun 1, Sep 1, Dec 1, each with a 20-day grace window.
+   Fixed calendar dates: test runs never shift them. The digest goes out on the first
+   successful run on/after each date; a 25-day Gmail dedup guarantees one send per window.
+   The GitHub cron fires daily through each window, which makes GitHub's unreliable
+   scheduler acceptable here (unlike the daily briefing, which needs Cloud Scheduler).
+   The dates sit ~2 months after quarter close because the report crop lands 3-10 weeks
+   after quarter end; to send right after quarter close instead, change the constant to
+   (1,1),(4,1),(7,1),(10,1) and move the cron months — nothing is missed either way,
+   slow-publishing reports just shift one digest later.
 2. **State**: the set of already-digested report editions rides inside the previously sent
    digest email as a hidden `<!-- DIGEST-MANIFEST-B64: ... -->` comment. No repo commits,
    no external storage. Anything collected that isn't in the manifest is "new".

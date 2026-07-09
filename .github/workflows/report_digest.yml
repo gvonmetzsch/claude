@@ -3,16 +3,18 @@ name: Electrical Industry Digest
 # Quarterly digest of electrical-industry research reports from middle-market
 # investment banks (FMI, Cascade Partners, Baird, Harris Williams, ...).
 #
-# Trigger design: unlike the daily briefing (which needs Cloud Scheduler
-# because GitHub's cron drops most ticks), a quarterly job tolerates GitHub's
-# best-effort scheduler fine — the cron fires DAILY through the first three
-# weeks of each digest month (Mar/Jun/Sep/Dec), and the script's guards
-# (digest-month check + sent-this-quarter Gmail dedup) collapse all those
-# ticks into exactly one send. Even a 90% drop rate leaves ~2 firing days.
+# Send dates are HARDCODED in generate_digest.py (DIGEST_SEND_DATES):
+# Mar 1, Jun 1, Sep 1, Dec 1 — fixed calendar dates, never relative to a
+# previous run or test send. Keep this cron in sync with those dates: it
+# fires DAILY from each date through its 20-day grace window, and the
+# script's guards (send-window check + sent-this-quarter Gmail dedup)
+# collapse the ticks into exactly one send. Even a 90% drop rate leaves
+# ~2 firing days, which is why GitHub's best-effort scheduler is fine here
+# (unlike the daily briefing, which needs Cloud Scheduler).
 #
-# Digest months are offset from quarter ends because banks publish their
-# quarterly reports ~3-10 weeks after the quarter closes:
-#   Mar -> Q4/H2 crop, Jun -> Q1, Sep -> Q2/H1, Dec -> Q3.
+# The dates sit ~2 months after each quarter closes because banks publish
+# quarterly reports 3-10 weeks after quarter end:
+#   Mar 1 -> Q4/H2 crop, Jun 1 -> Q1, Sep 1 -> Q2/H1, Dec 1 -> Q3.
 
 on:
   schedule:
