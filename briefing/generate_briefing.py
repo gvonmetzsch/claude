@@ -970,6 +970,10 @@ def generate_html_briefing(user_prompt: str, local_now) -> tuple[str, str]:
     with client.messages.stream(
         model="claude-sonnet-5",
         max_tokens=32000,
+        # Sonnet 5 defaults effort=high (adaptive thinking on) — but this is a
+        # formatting/synthesis task, not deep reasoning, so keep effort low to
+        # avoid paying for thinking tokens we don't need.
+        output_config={"effort": "low"},
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
     ) as stream:
@@ -981,7 +985,8 @@ def generate_html_briefing(user_prompt: str, local_now) -> tuple[str, str]:
     est = (u.input_tokens * 2 + u.output_tokens * 10) / 1_000_000
     log.info("Token usage: %d in / %d out — est. $%.4f (Sonnet 5 intro rates).",
              u.input_tokens, u.output_tokens, est)
-    html = message.content[0].text
+    # Take the first text block — with thinking on, content[0] may be a ThinkingBlock.
+    html = next((b.text for b in message.content if b.type == "text"), "")
     m = re.search(r'<!--\s*SUBJECT:\s*(.+?)\s*-->', html)
     subject = m.group(1).strip() if m else briefing_subject(local_now)
     return subject, html
