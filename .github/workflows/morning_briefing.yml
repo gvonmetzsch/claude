@@ -1,24 +1,24 @@
 name: Morning Briefing
 
-# Fires every 15 minutes, 24/7. GitHub's scheduled triggers are best-effort and
-# routinely delayed or dropped entirely under load — so instead of hand-placing
-# per-timezone cron times (which leaves long gaps where a single dropped event
-# means NO briefing that day), we run on a dense regular interval and let the
-# Python script decide when to actually send.
+# Triggered by an external Google Cloud Scheduler job that POSTs to the
+# workflow_dispatch API on a regular interval, 24/7. (GitHub's own `schedule:`
+# was best-effort and dropped ~95% of triggers, so it was removed — Cloud
+# Scheduler fires reliably. If Cloud Scheduler ever stops, the briefing simply
+# doesn't arrive; there is no other fallback by design.)
 #
 # The script only sends when local time is inside the morning window
 # (6:45 AM → 11:00 AM, see is_briefing_window) AND it hasn't already sent today
-# (Gmail dedup). So:
-#   - Exactly one email per day, regardless of how many runs fire.
-#   - Works in ANY timezone automatically (no per-tz cron upkeep).
-#   - The ~4h window means ~17 firings land inside it; GitHub can drop most of
-#     them and one will still get through. The repo is PUBLIC, so the frequent
-#     short no-op runs (which exit in seconds) cost nothing.
+# (Gmail dedup) — so exactly one email per day regardless of how many runs fire,
+# in whatever timezone the primary Google Calendar is set to.
+#
+# Keep the Cloud Scheduler interval comfortably WIDER than GitHub's worst-case
+# runner-allocation delay (minutes, and much longer during infra blips): the
+# concurrency group below serializes runs, so if dispatches arrive faster than
+# runners are granted, queued runs supersede/cancel each other and email a
+# failure. Every ~30 min is a safe cadence; do NOT go back to every 10 min.
 
 on:
-  schedule:
-    - cron: '*/15 * * * *'   # every 15 min, 24/7; script gates the actual send
-  workflow_dispatch:         # Manual trigger for testing
+  workflow_dispatch:         # Triggered by Google Cloud Scheduler (and manual tests)
     inputs:
       force_send:
         description: "Send a test briefing now, ignoring the 6:45 AM window"
