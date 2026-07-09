@@ -90,3 +90,9 @@ Electrical Marketing's free monthly EPI article + Excel.
 - **Source drift**: bank sites change slugs/patterns. Each collector is fail-soft, so drift
   shows up as a source silently contributing nothing — skim the run log's per-collector
   counts each quarter and re-verify any that dropped to 0.
+- **Known runner-IP blocks** (first live run, 2026-07-09): cascade-partners.com and
+  makeitelectric.org (NEMA) answer GitHub's datacenter IPs with HTTP 202 JS challenges,
+  though they serve residential IPs fine. Until Gus's email subscriptions are active (the
+  Cascade newsletter announces new editions, which the Gmail-scan collector then catches),
+  those two sources won't contribute from scheduled runs. 13 of 15 collectors work from
+  the runner; the first digest carried 18 reports without them.
