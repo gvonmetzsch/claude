@@ -255,7 +255,7 @@ def fetch_inbox(gmail_service, since_utc: datetime) -> list[dict]:
     result = gmail_service.users().threads().list(
         userId="me",
         q=f"in:inbox after:{since_str} -category:promotions",
-        maxResults=50,
+        maxResults=30,
     ).execute()
     threads = result.get("threads", [])
     enriched = []
@@ -306,7 +306,7 @@ def fetch_newsletter_body(gmail_service, thread_id: str) -> str:
         return ""
 
     text = extract(msgs[0].get("payload", {}))
-    return re.sub(r'\s+', ' ', text).strip()[:6000]
+    return re.sub(r'\s+', ' ', text).strip()[:3000]
 
 
 def _message_plain_text(detail: dict) -> str:
@@ -328,7 +328,7 @@ def _message_plain_text(detail: dict) -> str:
     return re.sub(r'\s+', ' ', extract(detail.get("payload", {}))).strip()
 
 
-def fetch_recent_briefings_text(gmail_service, n: int = 2) -> list[str]:
+def fetch_recent_briefings_text(gmail_service, n: int = 1) -> list[str]:
     """Plain text of the last n briefings already sent, so the model can avoid
     repeating the same scores/headlines/storylines day over day. Fail-soft → []."""
     try:
@@ -344,7 +344,7 @@ def fetch_recent_briefings_text(gmail_service, n: int = 2) -> list[str]:
             ).execute()
             txt = _message_plain_text(detail)
             if txt:
-                out.append(txt[:6000])
+                out.append(txt[:3000])
         log.info("Dedupe: loaded %d recent briefing(s).", len(out))
         return out
     except Exception as exc:
@@ -404,7 +404,7 @@ def fetch_calendar_events(calendar_service, tz_str: str) -> dict:
 
 # ─────────────────────────────── News search ───────────────────────────────
 
-def web_search(query: str, num: int = 5) -> list[dict]:
+def web_search(query: str, num: int = 3) -> list[dict]:
     """Search via the Brave Web Search endpoint (included in the free plan).
     Pulls any fresh news cluster first, then general web results.
     Fails soft to [] so the briefing still builds if Brave is unavailable."""
@@ -423,10 +423,10 @@ def web_search(query: str, num: int = 5) -> list[dict]:
         out = []
         for item in data.get("news", {}).get("results", []):
             out.append({"title": item.get("title"), "url": item.get("url"),
-                        "description": item.get("description", "")})
+                        "description": (item.get("description", "") or "")[:200]})
         for item in data.get("web", {}).get("results", []):
             out.append({"title": item.get("title"), "url": item.get("url"),
-                        "description": item.get("description", "")})
+                        "description": (item.get("description", "") or "")[:200]})
         return out[:num]
     except Exception as exc:
         log.warning("Brave search failed for '%s': %s", query, exc)
@@ -485,7 +485,7 @@ def fetch_espn_scores(local_now) -> dict:
             games = [_parse_espn_event(e) for e in resp.json().get("events", [])]
             games = [g for g in games if g.get("state") in ("in", "post")]  # drop not-yet-played
             if games:
-                out[label] = games
+                out[label] = games[:15]   # only ~3/sport are ever shown; cap the JSON sent to the model
         except Exception as exc:
             log.warning("ESPN scores failed for %s: %s", label, exc)
     log.info("ESPN scores: %s", {k: len(v) for k, v in out.items()})
@@ -739,7 +739,7 @@ def fetch_keep_todos() -> dict | None:
 # wide receive-window is necessary — the event-date filtering happens in-prompt.)
 EVENT_EMAIL_LOOKBACK = "12m"   # Gmail newer_than: window
 EVENT_HORIZON_DAYS   = 7       # only surface events dated today .. +N days
-EVENT_MAX_CANDIDATES = 300     # cap messages fetched (bounds latency + tokens)
+EVENT_MAX_CANDIDATES = 100     # cap messages fetched (bounds latency + tokens)
 
 # High-precision sources: ticketing, airlines/rail, lodging/travel, dining.
 _EVENT_SENDERS = [
@@ -896,7 +896,7 @@ def build_user_prompt(calendar_data, inbox_items, newsletters, news_results, tz_
         "\n# NEWSLETTER CONTENT (plain text, already stripped)\n",
     ]
     for name, text in newsletters.items():
-        parts.append(f"\n## {name}\n{text[:4000]}\n")
+        parts.append(f"\n## {name}\n{text[:3000]}\n")
     parts.append("\n# WEB SEARCH NEWS RESULTS (use to fill gaps only; NOT a source of sports scores)\n")
     for topic, results in news_results.items():
         parts.append(f"\n## {topic}\n{json.dumps(results, indent=2)}\n")
@@ -963,12 +963,12 @@ All CSS inline. No <style> block, no external resources, no web fonts, no JS. Co
 
 def generate_html_briefing(user_prompt: str, local_now) -> tuple[str, str]:
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    # Stream a large max_tokens: the inline-CSS table HTML is token-heavy, so an
-    # 8K cap truncated the email mid-tag. claude-opus-4-8 allows up to 128K output
-    # but the SDK requires streaming above ~16K (non-streaming would hit the
-    # ~10-min HTTP timeout). 32K is ample headroom for a full briefing.
+    # Sonnet 5 ($3/$15, intro $2/$10 through 2026-08-31) is ~40-60% cheaper than
+    # Opus with near-identical quality for a daily briefing. Stream a large
+    # max_tokens: the inline-CSS table HTML is token-heavy, so an 8K cap truncated
+    # the email mid-tag; the SDK requires streaming above ~16K anyway. 32K is ample.
     with client.messages.stream(
-        model="claude-opus-4-8",
+        model="claude-sonnet-5",
         max_tokens=32000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
@@ -976,6 +976,11 @@ def generate_html_briefing(user_prompt: str, local_now) -> tuple[str, str]:
         message = stream.get_final_message()
     if message.stop_reason == "max_tokens":
         log.warning("Briefing hit max_tokens (32000) — output may be truncated.")
+    # Per-run cost visibility (Sonnet 5 intro rates: $2/$10 per 1M tokens).
+    u = message.usage
+    est = (u.input_tokens * 2 + u.output_tokens * 10) / 1_000_000
+    log.info("Token usage: %d in / %d out — est. $%.4f (Sonnet 5 intro rates).",
+             u.input_tokens, u.output_tokens, est)
     html = message.content[0].text
     m = re.search(r'<!--\s*SUBJECT:\s*(.+?)\s*-->', html)
     subject = m.group(1).strip() if m else briefing_subject(local_now)
@@ -1058,21 +1063,18 @@ def main():
     nl_ids      = find_newsletter_threads(gmail_svc, since_utc)
     newsletters = {name: fetch_newsletter_body(gmail_svc, tid) for name, tid in nl_ids.items()}
 
+    # ESPN (fetch_espn_scores) is the AUTHORITATIVE source for NBA/NHL/MLB/World Cup/
+    # NCAA-lax scores, so the old per-sport score queries were redundant. These search
+    # topics now cover storylines + the sports ESPN doesn't (PLL lacrosse, golf).
     news_queries = {
-        "World headlines": "major world news today",
-        "Markets & macro": "stock market inflation interest rates today",
-        "M&A PE":          "M&A private equity deals fundraising",
-        "Tech AI":         "AI OpenAI Anthropic technology news today",
-        # Athletics — pull ACTUAL scores/results across sports (Gus's teams + marquee).
-        "Lacrosse":        "lacrosse PLL Premier Lacrosse League NCAA score result",
-        "NBA Finals":      "NBA Finals score result last night",
-        "NHL Stanley Cup": "NHL Stanley Cup Final score result last night",
-        "MLB":             "MLB scores last night Red Sox Giants Athletics",
-        "Golf":            "PGA Tour US Open golf leaderboard results today",
-        "Soccer/WC":       "FIFA World Cup 2026 results scores yesterday",
-        "Princeton":       "Princeton Tigers athletics score result",
-        "Boston teams":    "Celtics Bruins Red Sox score last night",
-        "Bay Area teams":  "Warriors Giants 49ers Sharks Athletics score last night",
+        "World headlines":  "major world news today",
+        "Markets & macro":  "stock market inflation interest rates today",
+        "M&A PE":           "M&A private equity deals fundraising",
+        "Tech AI":          "AI OpenAI Anthropic technology news today",
+        "Lacrosse":         "lacrosse PLL Premier Lacrosse League NCAA score result",
+        "Golf":             "PGA Tour golf major leaderboard results",
+        "Princeton":        "Princeton Tigers athletics news",
+        "Sports storylines":"NBA NHL MLB storylines Warriors Giants 49ers Sharks Celtics Bruins Red Sox",
     }
     news_results = {topic: web_search(q) for topic, q in news_queries.items()}
 
@@ -1088,7 +1090,7 @@ def main():
 
     # Authoritative scores (real, date-scoped) + last 2 briefings for dedupe.
     espn_scores      = fetch_espn_scores(local_now)
-    recent_briefings = fetch_recent_briefings_text(gmail_svc, n=2)
+    recent_briefings = fetch_recent_briefings_text(gmail_svc, n=1)
 
     user_prompt   = build_user_prompt(calendar_data, inbox_items, newsletters,
                                       news_results, tz_str, local_now,
