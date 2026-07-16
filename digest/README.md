@@ -87,16 +87,16 @@ Electrical Marketing's free monthly EPI article + Excel.
 
 ## Operations
 
-- **Test run any time — EXCEPT the ~25 days before a send date**: Actions → Electrical
-  Industry Digest → Run workflow → check `force_send`. The 25-day send-dedup counts manual
-  sends too, so a test between (send date - 25d) and the window close delays the scheduled
-  digest day-for-day, and a test in the last 5 days before a send date (e.g. Aug 28-31 for
-  Sep 1) pushes it past the 21-day window and SKIPS that quarter entirely. Bypasses the month + dedup guards. Note it digests everything not in the
-  manifest, so a forced run right before a scheduled one just means the scheduled one finds
-  nothing new (safe).
+- **Test run**: Actions → Electrical Industry Digest → Run workflow → check `force_send`
+  (bypasses the window + send-dedup guards; add `full_refresh` to also ignore the manifest
+  and rebuild everything). TIMING RULE: the 25-day send-dedup counts manual sends too, so a
+  test within 25 days before a send date delays the scheduled digest day-for-day, and a
+  test in the last ~5 days before one (e.g. Aug 28-31 for Sep 1) pushes it past the 21-day
+  window and SKIPS that quarter. Test freely otherwise; content-wise a forced run just
+  moves reports into the manifest so the scheduled run covers whatever remains.
 - **Local collection test (no secrets)**: `python digest/generate_digest.py --collect-only`
 - **Diagnosing**: like the briefing, a "success" run may not have sent — grep run logs for
-  `Digest sent` vs `Not a digest month` / `already sent` / `No new reports`.
+  `Digest sent` vs `Outside the hardcoded quarterly send windows` / `already sent` / `No new reports`.
 - **Secrets**: reuses `ANTHROPIC_API_KEY`, `GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN`. No new
   secrets. If Google auth dies with `invalid_grant`, see the briefing's fix (publish the
   OAuth consent screen, re-mint the token via OAuth Playground).
