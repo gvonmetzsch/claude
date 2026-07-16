@@ -87,8 +87,11 @@ Electrical Marketing's free monthly EPI article + Excel.
 
 ## Operations
 
-- **Test run any time**: Actions → Electrical Industry Digest → Run workflow → check
-  `force_send`. Bypasses the month + dedup guards. Note it digests everything not in the
+- **Test run any time — EXCEPT the ~25 days before a send date**: Actions → Electrical
+  Industry Digest → Run workflow → check `force_send`. The 25-day send-dedup counts manual
+  sends too, so a test between (send date - 25d) and the window close delays the scheduled
+  digest day-for-day, and a test in the last 5 days before a send date (e.g. Aug 28-31 for
+  Sep 1) pushes it past the 21-day window and SKIPS that quarter entirely. Bypasses the month + dedup guards. Note it digests everything not in the
   manifest, so a forced run right before a scheduled one just means the scheduled one finds
   nothing new (safe).
 - **Local collection test (no secrets)**: `python digest/generate_digest.py --collect-only`
