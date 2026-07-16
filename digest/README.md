@@ -18,8 +18,13 @@ Morning Briefing architecture.
    `DIGEST_SEND_DATES` — Mar 1, Jun 1, Sep 1, Dec 1, each with a 20-day grace window.
    Fixed calendar dates: test runs never shift them. The digest goes out on the first
    successful run on/after each date; a 25-day Gmail dedup guarantees one send per window.
-   The GitHub cron fires daily through each window, which makes GitHub's unreliable
-   scheduler acceptable here (unlike the daily briefing, which needs Cloud Scheduler).
+   **Two redundant triggers** fire daily through each window: GitHub's own cron
+   (14:00 UTC) and a Google Cloud Scheduler job (`report-digest` in project
+   `morning-briefing-499117`, us-central1, `10 14 1-21 3,6,9,12 *` UTC) that POSTs to the
+   workflow_dispatch API with the same PAT as the briefing's `morning-briefing` job. Either
+   path alone delivers; the guards + the workflow's concurrency group make duplicate sends
+   impossible. The Cloud Scheduler path also survives GitHub's 60-day-inactivity
+   auto-disable of `schedule:` triggers (dispatch triggers are never disabled).
    The dates sit ~2 months after quarter close because the report crop lands 3-10 weeks
    after quarter end; to send right after quarter close instead, change the constant to
    (1,1),(4,1),(7,1),(10,1) and move the cron months — nothing is missed either way,
@@ -76,8 +81,9 @@ Electrical Marketing's free monthly EPI article + Excel.
   - https://www.capstonepartners.com/insights-subscribe/ (Building Products & Construction Services + Energy, Power & Infrastructure)
   - https://pmcf.com/subscribe/ (Industrial Distribution + Construction & Building Products)
   - https://sdrventures.com/industry-report-request/ (Industrial & Infrastructure Services)
-- [ ] **Add recipients** once the boss approves the format:
-  `gh variable set DIGEST_RECIPIENTS -R gvonmetzsch/claude --body "gvonmetzsch@gmail.com,tom@...,boss@..."`
+- [x] **Recipients** (set 2026-07-16): configured in the `DIGEST_RECIPIENTS` repo variable
+  (not listed here — this repo is public). Change anytime with
+  `gh variable set DIGEST_RECIPIENTS -R gvonmetzsch/claude --body "..."`
 
 ## Operations
 

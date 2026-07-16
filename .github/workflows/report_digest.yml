@@ -25,6 +25,10 @@ on:
         description: "Send a digest now, ignoring the quarterly window and send-dedup (reports already digested in a previous email are still skipped)"
         type: boolean
         default: false
+      full_refresh:
+        description: "Also ignore the manifest: re-digest every collectable report from scratch"
+        type: boolean
+        default: false
 
 concurrency:
   group: report-digest
@@ -63,4 +67,5 @@ jobs:
           #   --body "gvonmetzsch@gmail.com,tom@example.com,boss@example.com"
           DIGEST_RECIPIENTS:    ${{ vars.DIGEST_RECIPIENTS }}
           FORCE_SEND:           ${{ inputs.force_send }}
+          FULL_REFRESH:         ${{ inputs.full_refresh }}
         run: python digest/generate_digest.py

@@ -892,7 +892,8 @@ def send_email(gmail_service, subject: str, html_body: str, recipients: list[str
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     try:
         gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
-        log.info("Digest sent: %s -> %s", subject, ", ".join(recipients))
+        # Count only — recipient addresses must not land in public Actions logs.
+        log.info("Digest sent: %s -> %d recipient(s)", subject, len(recipients))
     except Exception as exc:
         log.warning("Send failed (%s) — attempting draft fallback.", exc)
         try:
@@ -1185,7 +1186,14 @@ def main():
         log.info("FORCE_SEND enabled — bypassing month/dedup guards for a test run.")
 
     # 1. What have we already digested? (State rides in the last sent email.)
-    old_keys = fetch_last_manifest(gmail_svc)
+    #    FULL_REFRESH=true ignores it and re-digests everything fresh — use for
+    #    regenerating a complete digest (e.g. after adding recipients).
+    full_refresh = os.environ.get("FULL_REFRESH", "").strip().lower() == "true"
+    if full_refresh:
+        log.info("FULL_REFRESH enabled — ignoring the previous manifest.")
+        old_keys: set[str] = set()
+    else:
+        old_keys = fetch_last_manifest(gmail_svc)
 
     # 2. Collect the current report landscape.
     editions = collect_all(gmail_service=gmail_svc)
