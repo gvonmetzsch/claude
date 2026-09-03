@@ -7,7 +7,8 @@ name: Morning Briefing
 # doesn't arrive; there is no other fallback by design.)
 #
 # The script only sends when local time is inside the morning window
-# (6:45 AM → 11:00 AM, see is_briefing_window) AND it hasn't already sent today
+# (6:29 AM → 11:00 AM, see is_briefing_window; target delivery 6:30) AND it
+# hasn't already sent today
 # (Gmail dedup) — so exactly one email per day regardless of how many runs fire,
 # in whatever timezone the primary Google Calendar is set to.
 #
@@ -21,7 +22,7 @@ on:
   workflow_dispatch:         # Triggered by Google Cloud Scheduler (and manual tests)
     inputs:
       force_send:
-        description: "Send a test briefing now, ignoring the 6:45 AM window"
+        description: "Send a test briefing now, ignoring the 6:30 AM window"
         type: boolean
         default: false
 

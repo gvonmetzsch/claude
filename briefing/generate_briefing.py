@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Morning Briefing Generator for Gus von Metzsch
-Runs daily via GitHub Actions, delivers to gvonmetzsch@gmail.com at 6:45 AM local time.
+Runs daily via GitHub Actions, delivers to gvonmetzsch@gmail.com at 6:30 AM local time.
 Timezone is inferred from the most recent flight destination in Google Calendar.
 """
 
@@ -31,9 +31,12 @@ log = logging.getLogger(__name__)
 
 RECIPIENT = "gvonmetzsch@gmail.com"
 TARGET_HOUR = 6
-TARGET_MINUTE = 45
-# Send if local time is in [6:45 AM, MORNING_CUTOFF). Tolerates GitHub schedule
-# delays and lets the first morning run win; dedup prevents repeats.
+TARGET_MINUTE = 29
+# Send if local time is in [6:29 AM, MORNING_CUTOFF). Target delivery is 6:30:
+# Cloud Scheduler fires at :00/:30 (= :00/:30 local in CDMX, UTC-6 no DST), so the
+# 6:30 firing sends. The threshold is 6:29 (not 6:30) to absorb scheduler jitter /
+# runner timing so a firing that lands a hair before 6:30 still clears the window.
+# Tolerates delays and lets the first morning run win; dedup prevents repeats.
 MORNING_CUTOFF_HOUR = 11
 
 # ─── EMAIL THEME (edit me) ──────────────────────────────────────────────────
@@ -178,7 +181,7 @@ def infer_timezone(calendar_service) -> str:
 
 
 def is_briefing_window(tz_str: str) -> tuple[bool, datetime]:
-    """True if local time is between 6:45 AM and the morning cutoff."""
+    """True if local time is between 6:29 AM and the morning cutoff."""
     tz = pytz.timezone(tz_str)
     local_now = datetime.now(tz)
     after_start = (local_now.hour, local_now.minute) >= (TARGET_HOUR, TARGET_MINUTE)
