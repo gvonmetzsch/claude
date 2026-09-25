@@ -16,6 +16,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import parsedate_to_datetime
 
 import pytz
 import requests
@@ -407,6 +408,33 @@ def fetch_calendar_events(calendar_service, tz_str: str) -> dict:
 
 # ─────────────────────────────── News search ───────────────────────────────
 
+# Hard recency cutoff for any dated news item (WSJ RSS, Brave results). Kept a
+# few days wide so a Fri/weekend opinion piece still counts as "current reading"
+# while an obviously stale link (e.g. a months-old article) is dropped outright.
+# The prompt enforces a tighter preference on top of this floor.
+NEWS_MAX_AGE_DAYS = 4
+
+
+def _parse_news_date(raw: str):
+    """Best-effort parse of an RSS pubDate (RFC 822) or an ISO 8601 timestamp
+    into an aware UTC datetime. Returns None if it can't be parsed."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    # RFC 822, e.g. "Wed, 24 Sep 2026 10:30:00 GMT"
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt is not None:
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        pass
+    # ISO 8601, e.g. "2026-09-24T10:30:00Z" (Brave page_age)
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
 def web_search(query: str, num: int = 3) -> list[dict]:
     """Search via the Brave Web Search endpoint (included in the free plan).
     Pulls any fresh news cluster first, then general web results.
@@ -423,13 +451,26 @@ def web_search(query: str, num: int = 3) -> list[dict]:
         )
         resp.raise_for_status()
         data = resp.json()
-        out = []
-        for item in data.get("news", {}).get("results", []):
-            out.append({"title": item.get("title"), "url": item.get("url"),
-                        "description": (item.get("description", "") or "")[:200]})
-        for item in data.get("web", {}).get("results", []):
-            out.append({"title": item.get("title"), "url": item.get("url"),
-                        "description": (item.get("description", "") or "")[:200]})
+        cutoff = datetime.now(timezone.utc) - timedelta(days=NEWS_MAX_AGE_DAYS)
+        out, dropped = [], 0
+        for section in ("news", "web"):
+            for item in data.get(section, {}).get("results", []):
+                # Brave gives page_age (ISO) on most results; when present, use it
+                # as a hard recency gate. Undated results ride on the freshness=pd
+                # query param and the prompt's recency rule.
+                dt = _parse_news_date(item.get("page_age") or "")
+                if dt is not None and dt < cutoff:
+                    dropped += 1
+                    continue
+                out.append({
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "description": (item.get("description", "") or "")[:200],
+                    "date": dt.strftime("%Y-%m-%d") if dt else (item.get("age") or "undated"),
+                })
+        if dropped:
+            log.info("Brave '%s': dropped %d result(s) older than %d days.",
+                     query, dropped, NEWS_MAX_AGE_DAYS)
         return out[:num]
     except Exception as exc:
         log.warning("Brave search failed for '%s': %s", query, exc)
@@ -440,39 +481,72 @@ def web_search(query: str, num: int = 3) -> list[dict]:
 # Brave search returned generic trending news (Fox/DailyMail/BBC) for finance
 # queries and never real wsj.com articles, so the "WSJ" section had nothing good
 # to cite. WSJ publishes free RSS feeds of actual article URLs — use those.
+# HOST NOTE: the OLD host `feeds.a.dj.com/rss/*.xml` was FROZEN at Jan 2025 (it
+# still returns HTTP 200 with stale 8-month-old items — that shipped a Jan-2025
+# article on 2026-09-25). WSJ moved live feeds to `feeds.content.dowjones.io/
+# public/rss/<name>` (no .xml). Verified fresh 2026-09-25. If these ever freeze
+# again, the pubDate filter in fetch_wsj_finance_reading empties the section and
+# logs a stale-feed WARNING (grep "Feed may be stale") — the signal to re-probe.
+_DJ_RSS = "https://feeds.content.dowjones.io/public/rss/"
 WSJ_RSS_FEEDS = {
-    "Markets":  "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
-    "Business": "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",
-    "Opinion":  "https://feeds.a.dj.com/rss/RSSOpinion.xml",
+    "Markets":  _DJ_RSS + "RSSMarketsMain",
+    "Business": _DJ_RSS + "WSJcomUSBusiness",
+    "Opinion":  _DJ_RSS + "RSSOpinion",
 }
 
 
 def fetch_wsj_finance_reading(max_per_feed: int = 5) -> list[dict]:
     """Real WSJ article deep-links from WSJ's public RSS feeds (Markets/Business/
     Opinion) for the finance-reading section. Returns [{section,title,url,
-    description}]. Fail-soft → [] (better empty than fabricated)."""
+    description,date}], newest first, filtered to the last NEWS_MAX_AGE_DAYS.
+    Fail-soft → [] (better empty than fabricated OR stale).
+
+    RECENCY: every item is gated on its <pubDate>. An item with no parseable date
+    is dropped (WSJ RSS always dates items, so a missing date means something is
+    off). If a feed returns items but ALL of them are older than the cutoff, the
+    feed URL has almost certainly gone stale — that is logged as a WARNING with the
+    newest date seen, which is the signal to re-verify the feed."""
     import xml.etree.ElementTree as ET
     out = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=NEWS_MAX_AGE_DAYS)
     for section, url in WSJ_RSS_FEEDS.items():
         try:
             resp = requests.get(url, timeout=10,
                                 headers={"User-Agent": "morning-briefing/1.0"})
             resp.raise_for_status()
             root = ET.fromstring(resp.content)
-            for item in root.findall(".//item")[:max_per_feed]:
+            items, newest = [], None
+            for item in root.findall(".//item"):
                 link = (item.findtext("link") or "").strip()
                 if not link.startswith("http"):
                     continue
+                dt = _parse_news_date(item.findtext("pubDate") or "")
+                if dt is not None and (newest is None or dt > newest):
+                    newest = dt
+                if dt is None or dt < cutoff:
+                    continue
                 desc = re.sub(r"<[^>]+>", "", item.findtext("description") or "").strip()
-                out.append({
+                items.append({
                     "section": section,
                     "title": (item.findtext("title") or "").strip(),
                     "url": link,
                     "description": desc[:200],
+                    "date": dt.strftime("%Y-%m-%d"),
+                    "_dt": dt,
                 })
+            if not items and newest is not None:
+                log.warning("WSJ RSS %s: 0 recent items — newest is %s (>%d days old). "
+                            "Feed may be stale; re-verify the URL.",
+                            section, newest.strftime("%Y-%m-%d"), NEWS_MAX_AGE_DAYS)
+            items.sort(key=lambda x: x["_dt"], reverse=True)
+            for it in items[:max_per_feed]:
+                it.pop("_dt", None)
+                out.append(it)
         except Exception as exc:
             log.warning("WSJ RSS fetch failed for %s: %s", section, exc)
-    log.info("WSJ finance reading: %d real article links from RSS.", len(out))
+    out.sort(key=lambda x: x["date"], reverse=True)
+    log.info("WSJ finance reading: %d real article links from RSS (within %d days).",
+             len(out), NEWS_MAX_AGE_DAYS)
     return out
 
 
@@ -872,7 +946,7 @@ Briefing rules:
    b) QUICK KEY TASKS: a tight bulleted list of the few most important/actionable todos (drawn mainly from "Tasks"). Skip if there are none.
    c) CALENDAR & UPCOMING: bullet points with brief prose within each — today's events with times, tasks with due dates. If the calendar is empty today, say so in ONE line. After today, add a very brief prose overview of the day, next week, and next month (1-2 sentences each, weighted by how much is happening). Also fold in any EVENTS/TICKETS FROM EMAIL dated within the next week (concerts, games, flights, trips, hotel/restaurant reservations) that are NOT already on the calendar — list them like calendar items with their date/time and venue. A genuinely major one (a concert tonight, a flight today) may instead/also earn a mention in the opening paragraph (a). Only include an email-derived event if its date is clearly within the next week; never invent or guess a date.
 2. INBOX: Lead with time-sensitive items (deadlines, things awaiting a reply). One line per item with sender. SKIP newsletters here. Skip promotional/automated noise unless it has a clear action item (package/flight status, etc.). Sort by priority/action type, with a short 'potentially relevant' group at the end. No commentary on who emails are addressed to. If nothing substantial, say nothing about there being nothing.
-3. NEWS: Start from newsletter content, fill gaps with search results, preferring newsletter content. DEDUPE (critical): do NOT repeat any score, headline, or storyline that already appeared in the ALREADY REPORTED IN RECENT BRIEFINGS section — surface only NEW developments; ongoing items (series standings, tournaments in progress) may be updated with what changed but never restated unchanged. Priority order: world headlines (major items + maybe 1 niche cool one) -> MARKETS & FINANCE READING (the "WSJ" section — its PURPOSE is helping Gus follow markets and learn finance, so pick finance-substantive pieces: markets/macro, a notable deal or company, a rates/econ explainer, or a sharp finance op-ed; NOT generic news): 2-3 SPECIFIC articles drawn from the "Markets & finance reading" search results. Each link must be a real deep-link to an ACTUAL ARTICLE, copied verbatim from those results — NEVER a homepage or section front (a bare "wsj.com" or "wsj.com/finance" is unacceptable) and NEVER an invented/guessed URL. Prefer WSJ (wsj.com); FT/Bloomberg/Economist are fine, each labeled by its real outlet. If you only have 1-2 genuine article links, give 1-2 — do NOT pad to three with a homepage or a fabricated link -> markets & macro -> M&A/PE/dealflow -> tech/AI -> athletics (lacrosse NCAA D1 + pro, football, golf, snow sports, hockey, basketball, baseball; bias Princeton, Bay Area, Boston): keep the brief prose coverage of notable storylines/news, THEN a real SCOREBOARD grouped BY SPORT. Under each sport (e.g. NHL, NBA, MLB, Lacrosse, Golf, Soccer), a tight text list of games with the ACTUAL final score — "matchup — final score" (e.g. "Oilers vs Panthers (Stanley Cup Final G5) — EDM 3-1", "Red Sox @ Yankees — BOS 6-3", "Giants @ Dodgers — LAD 4-2"). Lead each sport with Gus's teams (Princeton; Bay Area: Warriors/Giants/49ers/Sharks/A's; Boston: Celtics/Bruins/Red Sox), then include other notable/marquee results — finals & championship games (e.g. the Stanley Cup Final, NBA Finals), big upsets, and tournament leaders/standings. Scores MUST be taken verbatim from the REAL SPORTS SCORES (ESPN) section — never from news snippets, prior knowledge, or inference. If a game is NOT in that data, do not report a score for it (you may mention the matchup as upcoming or result-pending from the news, but NEVER fabricate the outcome or winner). ALWAYS give the exact real score; NEVER vague summaries like "Germany dominant" or "close game". Per sport, include AT MOST 3 scores — lead with Gus's teams, then only genuinely notable/marquee results (finals, championship/playoff games, big upsets, rivalry games). Fewer than 3 is good; do NOT pad with routine regular-season games Gus has no connection to, and skip a sport entirely if it has nothing new or noteworthy (he is not a casual fan of every sport — quality over quantity) -> 3 unique niche cool things -> 3 learning points (>=1 on actionable tech/AI skill or workflow). Skip empty categories rather than padding. Tight, mostly bullets. LINKS (strict): every URL you include MUST be copied VERBATIM from the WEB SEARCH NEWS RESULTS provided — never a homepage or section front, never shortened, never constructed or guessed from memory. If you don't have a real article URL for an item, write the item without a link or omit it. Fewer real links always beats padded or fabricated ones.
+3. NEWS: Start from newsletter content, fill gaps with search results, preferring newsletter content. RECENCY (critical): only report genuinely CURRENT items — roughly the last few days. Many results carry a 'date' (YYYY-MM-DD) or age; if an item is older than ~3 days, DROP it, and if you cannot confirm an item is recent, leave it out rather than guess. A stale article (e.g. one dated weeks or months ago) must NEVER appear, especially in the MARKETS & FINANCE READING section — check each article's date before citing it. DEDUPE (critical): do NOT repeat any score, headline, or storyline that already appeared in the ALREADY REPORTED IN RECENT BRIEFINGS section — surface only NEW developments; ongoing items (series standings, tournaments in progress) may be updated with what changed but never restated unchanged. Priority order: world headlines (major items + maybe 1 niche cool one) -> MARKETS & FINANCE READING (the "WSJ" section — its PURPOSE is helping Gus follow markets and learn finance, so pick finance-substantive pieces: markets/macro, a notable deal or company, a rates/econ explainer, or a sharp finance op-ed; NOT generic news): 2-3 SPECIFIC articles drawn from the "Markets & finance reading" search results. Each link must be a real deep-link to an ACTUAL ARTICLE, copied verbatim from those results — NEVER a homepage or section front (a bare "wsj.com" or "wsj.com/finance" is unacceptable) and NEVER an invented/guessed URL. Prefer WSJ (wsj.com); FT/Bloomberg/Economist are fine, each labeled by its real outlet. If you only have 1-2 genuine article links, give 1-2 — do NOT pad to three with a homepage or a fabricated link -> markets & macro -> M&A/PE/dealflow -> tech/AI -> athletics (lacrosse NCAA D1 + pro, football, golf, snow sports, hockey, basketball, baseball; bias Princeton, Bay Area, Boston): keep the brief prose coverage of notable storylines/news, THEN a real SCOREBOARD grouped BY SPORT. Under each sport (e.g. NHL, NBA, MLB, Lacrosse, Golf, Soccer), a tight text list of games with the ACTUAL final score — "matchup — final score" (e.g. "Oilers vs Panthers (Stanley Cup Final G5) — EDM 3-1", "Red Sox @ Yankees — BOS 6-3", "Giants @ Dodgers — LAD 4-2"). Lead each sport with Gus's teams (Princeton; Bay Area: Warriors/Giants/49ers/Sharks/A's; Boston: Celtics/Bruins/Red Sox), then include other notable/marquee results — finals & championship games (e.g. the Stanley Cup Final, NBA Finals), big upsets, and tournament leaders/standings. Scores MUST be taken verbatim from the REAL SPORTS SCORES (ESPN) section — never from news snippets, prior knowledge, or inference. If a game is NOT in that data, do not report a score for it (you may mention the matchup as upcoming or result-pending from the news, but NEVER fabricate the outcome or winner). ALWAYS give the exact real score; NEVER vague summaries like "Germany dominant" or "close game". Per sport, include AT MOST 3 scores — lead with Gus's teams, then only genuinely notable/marquee results (finals, championship/playoff games, big upsets, rivalry games). Fewer than 3 is good; do NOT pad with routine regular-season games Gus has no connection to, and skip a sport entirely if it has nothing new or noteworthy (he is not a casual fan of every sport — quality over quantity) -> 3 unique niche cool things -> 3 learning points (>=1 on actionable tech/AI skill or workflow). Skip empty categories rather than padding. Tight, mostly bullets. LINKS (strict): every URL you include MUST be copied VERBATIM from the WEB SEARCH NEWS RESULTS provided — never a homepage or section front, never shortened, never constructed or guessed from memory. If you don't have a real article URL for an item, write the item without a link or omit it. Fewer real links always beats padded or fabricated ones.
 4. If any section/subsection is empty, skip it entirely with no mention (Calendar's 'empty today' one-liner is the only exception).
 5. FORMATTING — output ONLY the HTML email body (no DOCTYPE/html/head; just the visible content starting with a wrapper table). Hard requirements:
    - Table-based layout only (nested <table>; no <div> for structure). ALL CSS inline. No <style> block, no JS, no external resources, no web fonts. Web-safe fonts only: Arial/Helvetica for everything, Courier New ONLY for small uppercase section labels.
@@ -904,6 +978,13 @@ def build_user_prompt(calendar_data, inbox_items, newsletters, news_results, tz_
     parts = [
         f"# SUBJECT LINE\n{subject}\n",
         f"# CURRENT TIMEZONE\n{tz_str} (it is {local_now.strftime('%I:%M %p %Z')} locally)\n",
+        f"# TODAY IS {local_now.strftime('%A, %B %-d, %Y')}\n"
+        "RECENCY IS MANDATORY: this is a *today* briefing. News items below may carry a "
+        "'date' field (YYYY-MM-DD) or a relative age. Treat anything older than ~3 days as "
+        "stale and DROP it — never present a stale article, headline, or 'reading' as if it "
+        "were current. If you cannot confirm an item is from roughly the last few days, leave "
+        "it out. This applies to EVERY category (world, markets/finance reading, tech, sports "
+        "storylines, niche items). Fresh-but-fewer always beats padding with old material.\n",
     ]
 
     # OPENING INPUTS — feed WHOOP + todos so the email can lead with them.
