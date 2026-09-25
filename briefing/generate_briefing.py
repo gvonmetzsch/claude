@@ -587,24 +587,38 @@ def _parse_espn_event(ev: dict) -> dict:
 
 def fetch_espn_scores(local_now) -> dict:
     """Real scores (final + in-progress) from ESPN, scoped to yesterday→today
-    local. Per-league fail-soft; returns {} if nothing/everything errors."""
-    yday  = (local_now - timedelta(days=1)).strftime("%Y%m%d")
-    today = local_now.strftime("%Y%m%d")
-    dates = f"{yday}-{today}"
+    local. Per-league fail-soft; returns {} if nothing/everything errors.
+
+    DATE FORMAT GOTCHA (fixed 2026-09-25): ESPN's scoreboard endpoint returns
+    HTTP 400 on a hyphenated date RANGE (dates=YYYYMMDD-YYYYMMDD) — it used to be
+    the query and silently 400'd every league, emptying the scoreboard. Only the
+    single-day form (dates=YYYYMMDD) works, so we query each day separately and
+    merge, deduping by ESPN event id."""
+    days = [(local_now - timedelta(days=1)).strftime("%Y%m%d"),
+            local_now.strftime("%Y%m%d")]
     out = {}
     for label, path in ESPN_SCOREBOARDS.items():
-        try:
-            resp = requests.get(
-                f"https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard",
-                params={"dates": dates}, timeout=10,
-            )
-            resp.raise_for_status()
-            games = [_parse_espn_event(e) for e in resp.json().get("events", [])]
-            games = [g for g in games if g.get("state") in ("in", "post")]  # drop not-yet-played
-            if games:
-                out[label] = games[:15]   # only ~3/sport are ever shown; cap the JSON sent to the model
-        except Exception as exc:
-            log.warning("ESPN scores failed for %s: %s", label, exc)
+        seen, games = set(), []
+        for day in days:
+            try:
+                resp = requests.get(
+                    f"https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard",
+                    params={"dates": day}, timeout=10,
+                    headers={"User-Agent": "morning-briefing/1.0"},
+                )
+                resp.raise_for_status()
+                for e in resp.json().get("events", []):
+                    eid = e.get("id")
+                    if eid in seen:
+                        continue
+                    seen.add(eid)
+                    g = _parse_espn_event(e)
+                    if g.get("state") in ("in", "post"):   # drop not-yet-played
+                        games.append(g)
+            except Exception as exc:
+                log.warning("ESPN scores failed for %s on %s: %s", label, day, exc)
+        if games:
+            out[label] = games[:15]   # only ~3/sport are ever shown; cap the JSON sent to the model
     log.info("ESPN scores: %s", {k: len(v) for k, v in out.items()})
     return out
 
