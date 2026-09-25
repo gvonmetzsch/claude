@@ -601,10 +601,19 @@ def fetch_espn_scores(local_now) -> dict:
         seen, games = set(), []
         for day in days:
             try:
+                # HOST GOTCHA (2026-09-25): site.api.espn.com now 403-blocks
+                # datacenter/CI IPs (GitHub runners) via Akamai. The sibling host
+                # site.web.api.espn.com serves the same JSON without that block.
                 resp = requests.get(
-                    f"https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard",
+                    f"https://site.web.api.espn.com/apis/site/v2/sports/{path}/scoreboard",
                     params={"dates": day}, timeout=10,
-                    headers={"User-Agent": "morning-briefing/1.0"},
+                    headers={
+                        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                       "Chrome/124.0 Safari/537.36"),
+                        "Accept": "application/json",
+                        "Referer": "https://www.espn.com/",
+                    },
                 )
                 resp.raise_for_status()
                 for e in resp.json().get("events", []):
